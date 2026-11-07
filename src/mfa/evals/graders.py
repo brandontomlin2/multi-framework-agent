@@ -100,7 +100,9 @@ def claude_judge(model: str | None = None) -> Judge:
     """LLM-as-judge on Claude. The same judge grades every target, so scores are comparable."""
     import anthropic
 
-    client = anthropic.Anthropic()
+    from mfa.credentials import anthropic_client
+
+    client = anthropic_client()
     model = model or os.environ.get("MFA_JUDGE_MODEL", "claude-opus-5-5")
 
     def judge(case: EvalCase, result: AgentResult) -> Check:

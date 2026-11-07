@@ -2,7 +2,7 @@
 
 Model strings use ``provider:model``:
 
-* ``anthropic:claude-opus-5-5``          - Claude API (``ANTHROPIC_API_KEY``)
+* ``anthropic:claude-opus-5-5``          - Claude API (``MFA_ANTHROPIC_API_KEY`` or ``ANTHROPIC_API_KEY``)
 * ``google_vertexai:gemini-3.1-pro-preview`` - Gemini on Vertex AI (ADC)
 * ``anthropic_vertex:claude-opus-5-5``   - Claude on Vertex AI (ADC)
 
@@ -31,7 +31,10 @@ def make_chat_model(model: str) -> BaseChatModel:
 
         # Current Claude models think adaptively by default and reject sampling
         # params, so only max_tokens is set.
-        return ChatAnthropic(model=model_id, max_tokens=16000)
+        from mfa.credentials import anthropic_api_key
+
+        key = anthropic_api_key()
+        return ChatAnthropic(model=model_id, max_tokens=16000, **({"api_key": key} if key else {}))
 
     if provider == "google_vertexai":
         from langchain_google_vertexai import ChatVertexAI

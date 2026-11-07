@@ -68,3 +68,15 @@ def test_live_provider_failure_is_reported_not_raised(monkeypatch):
     with mock.patch.object(weather, "_get_json", side_effect=OSError("network down")):
         out = weather.today("Paris")
     assert out["found"] is False and "unavailable" in out["error"]
+
+
+def test_mfa_specific_key_takes_precedence(monkeypatch):
+    from mfa.credentials import anthropic_client
+    from mfa.runtime.models import make_chat_model
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-generic")
+    monkeypatch.setenv("MFA_ANTHROPIC_API_KEY", "sk-mfa")
+    assert anthropic_client().api_key == "sk-mfa"
+    assert make_chat_model("anthropic:claude-opus-5-5").anthropic_api_key.get_secret_value() == "sk-mfa"
+    monkeypatch.delenv("MFA_ANTHROPIC_API_KEY")
+    assert anthropic_client().api_key == "sk-generic"

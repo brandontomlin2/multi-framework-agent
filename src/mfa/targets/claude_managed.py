@@ -14,7 +14,7 @@ targets. The built-in agent toolset (bash, files, web) is left off by default
 so the agent has exactly the tools the spec declares; set
 ``MFA_CMA_ENABLE_TOOLSET=1`` to add it.
 
-Credentials: ``ANTHROPIC_API_KEY`` (or an ``ant auth login`` profile).
+Credentials: ``MFA_ANTHROPIC_API_KEY`` or ``ANTHROPIC_API_KEY`` (or an ``ant auth login`` profile).
 """
 
 from __future__ import annotations
@@ -66,9 +66,9 @@ def build_agent_params(spec: AgentSpec, model: str) -> dict[str, Any]:
 
 
 def _client():
-    import anthropic
+    from mfa.credentials import anthropic_client
 
-    return anthropic.Anthropic()
+    return anthropic_client()
 
 
 class ClaudeManagedRunner:

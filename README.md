@@ -66,8 +66,10 @@ If GitHub Actions can't run (for example the account's Actions billing is blocke
 | `local` | Credentials for `models["local"]`: `ANTHROPIC_API_KEY` for `anthropic:*`, or ADC + `GOOGLE_CLOUD_PROJECT` for `google_vertexai:*` / `anthropic_vertex:*` |
 | `cloud_run` | `gcloud` logged in, `GOOGLE_CLOUD_PROJECT`. Optional: `MFA_CLOUD_RUN_REGION` (default `us-central1`), `MFA_CLOUD_RUN_SERVICE_ACCOUNT`, `MFA_CLOUD_RUN_ALLOW_UNAUTHENTICATED=1` (off by default, so callers need an identity token; the runner fetches one) |
 | `agent_engine` | ADC, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` (default `us-central1`), `MFA_STAGING_BUCKET=gs://...`. Optional: `MFA_AGENT_ENGINE_SERVICE_ACCOUNT` |
-| `claude_managed` | `ANTHROPIC_API_KEY` (or an `ant auth login` profile). Optional: the `ant` CLI if you use the file-based flow |
-| LLM judge | `ANTHROPIC_API_KEY`. Default judge is `claude-opus-5-5` at low effort, override with `MFA_JUDGE_MODEL`. `--no-judge` runs only the deterministic checks |
+| `claude_managed` | `MFA_ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY` (or an `ant auth login` profile). Optional: the `ant` CLI if you use the file-based flow |
+| LLM judge | `MFA_ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY`. Default judge is `claude-opus-5-5` at low effort, override with `MFA_JUDGE_MODEL`. `--no-judge` runs only the deterministic checks |
+
+**Anthropic key:** create it at platform.claude.com → Settings → API Keys. `mfa` reads `MFA_ANTHROPIC_API_KEY` first, then `ANTHROPIC_API_KEY`. Use `MFA_ANTHROPIC_API_KEY` wherever other tools also read `ANTHROPIC_API_KEY`, for example in a Claude Code cloud environment, where Claude Code would pick that name up too. In GitHub Actions, store it as the repository secret `ANTHROPIC_API_KEY`.
 
 To use a Claude API model inside either Gemini target, set `MFA_ANTHROPIC_SECRET` to a Secret Manager secret holding the key.
 
