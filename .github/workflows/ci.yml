@@ -12,6 +12,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[all]"
-      # Offline: fake LLM / fake Agent Engine / fake Managed Agents API.
-      - run: pytest -q
+      # Same script developers run locally (scripts/ci.sh); offline, no credentials.
+      - run: scripts/ci.sh

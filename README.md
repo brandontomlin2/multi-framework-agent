@@ -56,7 +56,10 @@ tests/                       offline: fake LLM, fake Agent Runtime, fake CMA API
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[all]"        # extras: anthropic, vertex, serving, dev
 pytest -q                      # offline, no credentials needed
+scripts/ci.sh                  # the CI check in a fresh venv (what GitHub Actions runs)
 ```
+
+If GitHub Actions can't run (for example the account's Actions billing is blocked), `scripts/ci.sh --post-status` runs the same check and posts the result to the commit as a separate `local-ci (scripts/ci.sh)` status. The description says where it ran, so nobody mistakes it for the Actions check.
 
 | Target | Needs |
 |---|---|
