@@ -22,15 +22,15 @@ class CannedRunner:
 
 
 def test_shared_dataset_is_valid():
-    spec = load_agent("support_agent")
+    spec = load_agent("weather_agent")
     cases = load_cases(spec.eval_dataset)
     assert len(cases) >= 10
     tool_names = {t.name for t in spec.tools}
     for c in cases:
-        for name in [*c.expect.tools_called, *c.expect.tools_not_called, *c.expect.tool_args]:
+        for name in [*c.expect.tools_called, *c.expect.tools_not_called, *c.expect.tool_args, *c.expect.tool_args_contain]:
             assert name in tool_names, f"{c.id} references unknown tool {name}"
     assert load_cases(spec.eval_dataset, tags=["smoke"])
-    assert [c.id for c in load_cases(spec.eval_dataset, ids=["out_of_scope"])] == ["out_of_scope"]
+    assert [c.id for c in load_cases(spec.eval_dataset, ids=["asks_for_location"])] == ["asks_for_location"]
 
 
 def test_deterministic_checks():
@@ -38,7 +38,7 @@ def test_deterministic_checks():
         "id": "x", "input": "hi",
         "expect": {
             "tools_called": ["a"], "tools_not_called": ["b"],
-            "tool_args": {"a": {"order_id": "ord-1"}},
+            "tool_args": {"a": {"order_id": "ord-1"}}, "tool_args_contain": {"a": {"order_id": "ord"}},
             "output_contains": ["Shipped"], "output_contains_any": ["ups", "fedex"],
             "output_not_contains": ["sorry"], "output_regex": r"TCK-\d+", "max_tool_calls": 1,
         },
@@ -48,7 +48,7 @@ def test_deterministic_checks():
     assert all(c.passed for c in deterministic_checks(case.expect, good))
     bad = AgentResult(target="t", input="hi", output="sorry", tool_calls=[ToolCall(name="b")])
     failed = {c.name for c in deterministic_checks(case.expect, bad) if not c.passed}
-    assert {"called:a", "not_called:b", "args:a", "contains:Shipped", "regex"} <= failed
+    assert {"called:a", "not_called:b", "args:a", "args_contain:a", "contains:Shipped", "regex"} <= failed
 
 
 def test_harness_multi_turn_judge_and_reports(tmp_path):

@@ -133,7 +133,7 @@ class AgentEngineTarget:
 
         app = LangGraphAgentApp(agent_ref=agent_module_ref(spec, agent_ref or spec.name), model=model)
 
-        env_vars: dict[str, Any] = {"GOOGLE_CLOUD_LOCATION": location}
+        env_vars: dict[str, Any] = {"GOOGLE_CLOUD_LOCATION": location, **deployments.forwarded_env()}
         if parse_model(model)[0] == "anthropic":
             secret = os.environ.get("MFA_ANTHROPIC_SECRET")
             if not secret:

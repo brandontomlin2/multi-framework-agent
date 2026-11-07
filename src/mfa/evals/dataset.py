@@ -3,22 +3,24 @@
 YAML format::
 
     cases:
-      - id: order_status
-        input: "Where is order ORD-1001?"       # or `turns: [..]` for multi-turn
-        tags: [orders]
+      - id: weather_in_paris
+        input: "What's the weather in Paris today?"   # or `turns: [..]` for multi-turn
+        tags: [weather]
         expect:
-          tools_called: [get_order_status]       # each must be called at least once
-          tools_not_called: [create_support_ticket]
+          tools_called: [get_weather_today]      # each must be called at least once
+          tools_not_called: []
           no_tool_calls: false
-          tool_args:                             # subset match on the first call of each tool
-            get_order_status: {order_id: ORD-1001}
-          max_tool_calls: 3
-          output_contains: ["shipped"]           # all, case-insensitive
-          output_contains_any: ["UPS", "tracking"]
+          tool_args:                             # exact (case-insensitive) match on some call's args
+            get_weather_today: {location: Paris}
+          tool_args_contain:                     # substring match: "Paris, France" also passes
+            get_weather_today: {location: paris}
+          max_tool_calls: 2
+          output_contains: ["Paris"]             # all, case-insensitive
+          output_contains_any: ["°F", "°C"]
           output_not_contains: ["I don't know"]
-          output_regex: "1Z\\\\w+"
+          output_regex: "\\\\d+ ?°"
         judge: >-                                # optional LLM-as-judge rubric
-          The reply gives the shipping status and the tracking number.
+          The reply gives today's conditions and temperatures that match the tool output.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ class Expectations(BaseModel):
     tools_not_called: list[str] = Field(default_factory=list)
     no_tool_calls: bool = False
     tool_args: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    tool_args_contain: dict[str, dict[str, str]] = Field(default_factory=dict)
     max_tool_calls: int | None = None
     output_contains: list[str] = Field(default_factory=list)
     output_contains_any: list[str] = Field(default_factory=list)

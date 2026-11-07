@@ -1,4 +1,4 @@
-"""Resolve an agent reference (``support_agent`` or ``pkg.module:ATTR``) to its AgentSpec."""
+"""Resolve an agent reference (``weather_agent`` or ``pkg.module:ATTR``) to its AgentSpec."""
 
 from __future__ import annotations
 

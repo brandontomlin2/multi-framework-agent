@@ -38,3 +38,13 @@ def require(agent: str, target: str, root: Path | None = None) -> dict[str, Any]
             f"Run: mfa deploy {agent} --target {target}"
         )
     return rec
+
+
+def forwarded_env() -> dict[str, str]:
+    """Env vars named in MFA_FORWARD_ENV (comma list) are copied into deployed containers.
+
+    Lets an agent's own settings (e.g. MFA_WEATHER_PROVIDER) reach Gemini platform
+    targets without the framework knowing about them.
+    """
+    names = [n.strip() for n in os.environ.get("MFA_FORWARD_ENV", "").split(",") if n.strip()]
+    return {n: os.environ[n] for n in names if n in os.environ}

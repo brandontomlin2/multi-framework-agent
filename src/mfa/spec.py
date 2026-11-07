@@ -59,10 +59,18 @@ class ToolSpec:
         result = self.func(**args)
         if isinstance(result, str):
             return result
-        return json.dumps(result, default=str)
+        return json.dumps(result, default=str, ensure_ascii=False)
 
     def to_langchain(self) -> BaseTool:
-        return StructuredTool.from_function(self.func, name=self.name, parse_docstring=True)
+        # Same schema as the function, but results go through invoke() so every
+        # target (LangGraph or Claude Managed Agents) hands the model identical text.
+        schema = StructuredTool.from_function(self.func, parse_docstring=True).args_schema
+        return StructuredTool(
+            name=self.name,
+            description=self.description,
+            args_schema=schema,
+            func=lambda **kwargs: self.invoke(kwargs),
+        )
 
 
 def tool(func: Callable[..., Any]) -> ToolSpec:

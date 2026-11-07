@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       agent:
-        default: support_agent
+        default: weather_agent
       target:
         description: "local | agent_engine | claude_managed | all (comma list ok)"
         default: local

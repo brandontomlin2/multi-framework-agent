@@ -2,16 +2,16 @@
 
 Targets: local | agent_engine (Agent Runtime) | cloud_run (container, A2A) | claude_managed
 
-    mfa deploy   support_agent --target claude_managed
-    mfa run      support_agent --target local "Where is order ORD-1001?"
-    mfa chat     support_agent --target agent_engine
-    mfa eval     support_agent --target all --min-pass-rate 0.9
-    mfa compare  eval_results/support_agent/*.json
-    mfa show     support_agent --target claude_managed      # print the translated config
-    mfa build    support_agent -o build/support_agent        # container context (docker / agents-cli)
-    mfa export   support_agent -t claude_managed -o deploy/claude_managed   # ant apply files
-    mfa export   support_agent -t gemini_eval --report eval_results/support_agent/x.json -o traces.json
-    mfa register support_agent -t claude_managed --agent-id agent_... --environment-id env_...
+    mfa deploy   weather_agent --target claude_managed
+    mfa run      weather_agent --target local "What's the weather in Paris today?"
+    mfa chat     weather_agent --target agent_engine
+    mfa eval     weather_agent --target all --min-pass-rate 0.9
+    mfa compare  eval_results/weather_agent/*.json
+    mfa show     weather_agent --target claude_managed      # print the translated config
+    mfa build    weather_agent -o build/weather_agent        # container context (docker / agents-cli)
+    mfa export   weather_agent -t claude_managed -o deploy/claude_managed   # ant apply files
+    mfa export   weather_agent -t gemini_eval --report eval_results/weather_agent/x.json -o traces.json
+    mfa register weather_agent -t claude_managed --agent-id agent_... --environment-id env_...
 """
 
 from __future__ import annotations

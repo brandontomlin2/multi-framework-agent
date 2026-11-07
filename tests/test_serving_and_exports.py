@@ -19,10 +19,10 @@ from mfa.targets.cloud_run import CloudRunRunner
 from mfa.targets.container import build_context
 from tests.fakes import FakeCMAClient, ScriptedChatModel
 
-SPEC = load_agent("support_agent")
+SPEC = load_agent("weather_agent")
 SCRIPT = [
-    {"tool": "get_order_status", "args": {"order_id": "ORD-1001"}},
-    {"text": "Shipped via UPS, tracking 1Z999AA10123456784."},
+    {"tool": "get_weather_today", "args": {"location": "Paris"}},
+    {"text": "In Paris today: partly cloudy, 54°F (12°C), high 59°F (15°C), low 46°F (8°C), 10% chance of rain."},
 ]
 
 
@@ -49,10 +49,10 @@ def test_cloud_run_borrows_the_gemini_model_without_spec_changes():
 
 
 def test_serving_query_returns_normalized_result(client):
-    body = client.post("/mfa/query", json={"input": "where is ORD-1001?"}).json()
+    body = client.post("/mfa/query", json={"input": "weather in Paris today?"}).json()
     r = AgentResult.model_validate(body)
-    assert r.tool_names == ["get_order_status"] and "1Z999AA10123456784" in r.output
-    assert client.get("/health").json()["agent"] == "support_agent"
+    assert r.tool_names == ["get_weather_today"] and "partly cloudy" in r.output
+    assert client.get("/health").json()["agent"] == "weather_agent"
 
 
 def test_a2a_card_and_message_send(client):
@@ -61,11 +61,11 @@ def test_a2a_card_and_message_send(client):
     resp = client.post("/a2a/app", json={
         "jsonrpc": "2.0", "id": 1, "method": "message/send",
         "params": {"message": {"kind": "message", "messageId": "m1", "role": "user",
-                               "parts": [{"kind": "text", "text": "where is ORD-1001?"}]}},
+                               "parts": [{"kind": "text", "text": "weather in Paris today?"}]}},
     }).json()
     texts = [p["text"] for a in resp["result"]["artifacts"] for p in a["parts"]]
     # Only the assistant reply is streamed, never the raw tool output.
-    assert "".join(texts) == "Shipped via UPS, tracking 1Z999AA10123456784."
+    assert "".join(texts) == "In Paris today: partly cloudy, 54°F (12°C), high 59°F (15°C), low 46°F (8°C), 10% chance of rain."
 
 
 def test_cloud_run_runner_against_served_app(client, monkeypatch):
@@ -91,14 +91,14 @@ def test_cloud_run_runner_against_served_app(client, monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     report = run_eval(
         agent=SPEC.name, runner=CloudRunRunner("http://svc"),
-        cases=load_cases(SPEC.eval_dataset, ids=["order_status_shipped"]), judge=None,
+        cases=load_cases(SPEC.eval_dataset, ids=["weather_with_city"]), judge=None,
     )
     assert report.pass_rate == 1.0 and report.target == CLOUD_RUN
 
 
 def test_container_context_follows_agents_cli_contract(tmp_path):
     out = build_context(SPEC, "anthropic:claude-opus-5-5", tmp_path / "ctx")
-    for f in ["app/agent.py", "app/fast_api_app.py", "Dockerfile", "requirements.txt", "agents/support_agent/agent.py"]:
+    for f in ["app/agent.py", "app/fast_api_app.py", "Dockerfile", "requirements.txt", "agents/weather_agent/agent.py"]:
         assert (out / f).exists(), f
     assert "uvicorn app.fast_api_app:app" in (out / "Dockerfile").read_text()
     reqs = (out / "requirements.txt").read_text()
@@ -107,7 +107,7 @@ def test_container_context_follows_agents_cli_contract(tmp_path):
     code = "from app.agent import root_agent; print(type(root_agent).__name__)"
     res = subprocess.run(
         [sys.executable, "-c", code], cwd=out, capture_output=True, text=True,
-        env={"MFA_AGENT": "support_agent", "MFA_MODEL": "anthropic:claude-opus-5-5",
+        env={"MFA_AGENT": "weather_agent", "MFA_MODEL": "anthropic:claude-opus-5-5",
              "ANTHROPIC_API_KEY": "dummy", "PATH": "/usr/bin:/bin"},
     )
     assert res.returncode == 0, res.stderr
@@ -118,7 +118,7 @@ def test_cma_deploy_reuses_existing_environment_by_name():
     client = FakeCMAClient()
     from types import SimpleNamespace
 
-    client.existing_envs = [SimpleNamespace(id="env_existing", name="support_agent-env")]
+    client.existing_envs = [SimpleNamespace(id="env_existing", name="weather_agent-env")]
     rec = ClaudeManagedTarget().deploy(SPEC, client=client)
     assert rec["environment_id"] == "env_existing" and client.env_creates == 0
 
@@ -146,18 +146,18 @@ def test_gemini_eval_export_shape():
 
             if text == "a":
                 return AgentResult(target=self.target, input=text, output="",
-                                   tool_calls=[ToolCall(name="get_order_status", args={"order_id": "ORD-1"},
+                                   tool_calls=[ToolCall(name="get_weather_today", args={"location": "Atlantis"},
                                                         output='{"found": false}')])
             return AgentResult(target=self.target, input=text, output="done")
 
     case = EvalCase(id="mt", turns=["a", "b"], judge="be right")
-    report = run_eval(agent="support_agent", runner=Multi(), cases=[case], judge=None)
+    report = run_eval(agent="weather_agent", runner=Multi(), cases=[case], judge=None)
     data = to_gemini_eval_dataset(report, cases_by_id={"mt": case})
     ec = data["eval_cases"][0]
     assert ec["eval_case_id"] == "mt" and ec["rubric"] == "be right"
     t0, t1 = ec["agent_data"]["turns"]
-    assert [e["author"] for e in t0["events"]] == ["user", "support_agent", "tool"]
-    assert t0["events"][1]["content"]["parts"][0]["function_call"]["name"] == "get_order_status"
+    assert [e["author"] for e in t0["events"]] == ["user", "weather_agent", "tool"]
+    assert t0["events"][1]["content"]["parts"][0]["function_call"]["name"] == "get_weather_today"
     assert t0["events"][2]["content"]["parts"][0]["function_response"]["response"] == {"found": False}
     assert t1["events"][-1]["content"]["parts"][0]["text"] == "done"
     json.dumps(data)
@@ -165,10 +165,10 @@ def test_gemini_eval_export_shape():
 
 def test_built_container_bakes_in_selected_model_and_agent(tmp_path):
     """The default runtime model must match the provider packages in requirements.txt."""
-    out = build_context(SPEC, "anthropic:claude-opus-5-5", tmp_path / "ctx", agent_ref="support_agent")
+    out = build_context(SPEC, "anthropic:claude-opus-5-5", tmp_path / "ctx", agent_ref="weather_agent")
     dockerfile = (out / "Dockerfile").read_text()
     assert "MFA_MODEL=anthropic:claude-opus-5-5" in dockerfile
-    assert "MFA_AGENT=support_agent" in dockerfile
+    assert "MFA_AGENT=weather_agent" in dockerfile
     assert "langchain-anthropic" in (out / "requirements.txt").read_text()
 
 
@@ -178,7 +178,7 @@ def test_a2a_route_applies_spec_iteration_limit(monkeypatch):
     load_root_agent.cache_clear()
     monkeypatch.setattr(SPEC, "max_iterations", 2)
     monkeypatch.setenv("MFA_MODEL", "x:y")
-    looping = [{"tool": "get_order_status", "args": {"order_id": "ORD-1001"}}] * 10 + [{"text": "FINAL"}]
+    looping = [{"tool": "get_weather_today", "args": {"location": "Paris"}}] * 10 + [{"text": "FINAL"}]
     monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=looping))
     from mfa.serving.fast_api_app import create_app
 
@@ -192,3 +192,8 @@ def test_a2a_route_applies_spec_iteration_limit(monkeypatch):
     finally:
         load_root_agent.cache_clear()
     assert "error" in resp and "Recursion limit of 5" in resp["error"]["message"]
+
+
+def test_forwarded_env_lists_only_named_vars(monkeypatch):
+    monkeypatch.setenv("MFA_FORWARD_ENV", "MFA_WEATHER_PROVIDER, MISSING_VAR")
+    assert deployments.forwarded_env() == {"MFA_WEATHER_PROVIDER": "fixture"}

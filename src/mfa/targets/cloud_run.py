@@ -93,6 +93,7 @@ class CloudRunTarget:
             "MFA_TARGET": CLOUD_RUN,
             "GOOGLE_CLOUD_PROJECT": project,
             "A2A_NAME": "app",
+            **deployments.forwarded_env(),
         }
         cmd = [
             "gcloud", "run", "deploy", service_name(spec),

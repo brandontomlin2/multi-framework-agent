@@ -1,37 +1,70 @@
 import json
+from datetime import date
+from unittest import mock
 
 from mfa.registry import load_agent
-from mfa.spec import AGENT_ENGINE, CLAUDE_MANAGED, LOCAL
+from mfa.spec import AGENT_ENGINE, CLAUDE_MANAGED, CLOUD_RUN, LOCAL
+
+from agents.weather_agent import weather
 
 
 def test_agent_loads_by_short_name_and_module_ref():
-    a = load_agent("support_agent")
-    b = load_agent("agents.support_agent.agent:AGENT")
+    a = load_agent("weather_agent")
+    b = load_agent("agents.weather_agent.agent:AGENT")
     assert a is b
-    assert {t.name for t in a.tools} == {
-        "get_order_status",
-        "check_refund_eligibility",
-        "search_policies",
-        "create_support_ticket",
-    }
-    for target in (LOCAL, AGENT_ENGINE, CLAUDE_MANAGED):
+    assert [t.name for t in a.tools] == ["get_weather_today"]
+    for target in (LOCAL, AGENT_ENGINE, CLOUD_RUN, CLAUDE_MANAGED):
         assert a.model_for(target)
 
 
 def test_tool_schema_is_derived_from_signature_and_docstring():
-    spec = load_agent("support_agent")
-    t = spec.tool_by_name("create_support_ticket")
-    assert t.input_schema["type"] == "object"
-    assert set(t.input_schema["required"]) == {"summary", "priority"}
-    assert "order identifier" in t.input_schema["properties"]["order_id"]["description"]
+    t = load_agent("weather_agent").tool_by_name("get_weather_today")
+    assert t.input_schema["required"] == ["location"]
+    assert "Portland, Maine" in t.input_schema["properties"]["location"]["description"]
     assert "title" not in t.input_schema
 
 
-def test_tools_are_deterministic():
-    spec = load_agent("support_agent")
-    out = json.loads(spec.tool_by_name("check_refund_eligibility").invoke({"order_id": "ORD-1002"}))
-    assert out["eligible"] is True and out["amount"] == 215.0
-    out = json.loads(spec.tool_by_name("check_refund_eligibility").invoke({"order_id": "ord-1003"}))
-    assert out["eligible"] is False
-    hits = json.loads(spec.tool_by_name("search_policies").invoke({"query": "standard shipping free"}))
-    assert hits[0]["topic"] == "shipping"
+def test_fixture_provider_is_deterministic():
+    t = load_agent("weather_agent").tool_by_name("get_weather_today")
+    out = json.loads(t.invoke({"location": "Paris, France"}))
+    assert out["found"] and out["location"]["country"] == "France"
+    assert out["date"] == date.today().isoformat()
+    assert out["today"]["high_c"] == 15.0 and out["today"]["high_f"] == 59.0
+    assert json.loads(t.invoke({"location": "Nowhereville"}))["found"] is False
+    assert "other_matches" in json.loads(t.invoke({"location": "portland"}))
+
+
+def _fake_open_meteo(url, params):
+    if "geocoding" in url:
+        if params["name"] == "Nowhere":
+            return {}
+        return {"results": [
+            {"name": "Portland", "admin1": "Oregon", "country": "United States", "country_code": "US",
+             "latitude": 45.5, "longitude": -122.7, "timezone": "America/Los_Angeles"},
+            {"name": "Portland", "admin1": "Maine", "country": "United States", "country_code": "US",
+             "latitude": 43.7, "longitude": -70.3, "timezone": "America/New_York"},
+        ]}
+    assert params["timezone"] == "auto" and params["forecast_days"] == 1
+    return {
+        "current": {"temperature_2m": 10.0, "apparent_temperature": 8.0, "weather_code": 3, "wind_speed_10m": 12.0},
+        "daily": {"time": ["2026-11-07"], "weather_code": [61], "temperature_2m_max": [12.0],
+                  "temperature_2m_min": [4.0], "precipitation_probability_max": [80]},
+    }
+
+
+def test_open_meteo_parsing_and_disambiguation():
+    with mock.patch.object(weather, "_get_json", side_effect=_fake_open_meteo):
+        r = weather.open_meteo("Portland, Maine")
+        assert r["location"]["admin1"] == "Maine"
+        assert r["other_matches"] == ["Portland, Oregon, United States"]
+        assert r["today"] == {"conditions": "slight rain", "high_c": 12.0, "high_f": 53.6, "low_c": 4.0,
+                              "low_f": 39.2, "precipitation_chance_pct": 80}
+        assert r["current"]["conditions"] == "overcast" and r["date"] == "2026-11-07"
+        assert weather.open_meteo("Nowhere")["found"] is False
+
+
+def test_live_provider_failure_is_reported_not_raised(monkeypatch):
+    monkeypatch.setenv("MFA_WEATHER_PROVIDER", "open-meteo")
+    with mock.patch.object(weather, "_get_json", side_effect=OSError("network down")):
+        out = weather.today("Paris")
+    assert out["found"] is False and "unavailable" in out["error"]

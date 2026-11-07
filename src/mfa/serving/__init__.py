@@ -25,6 +25,6 @@ def load_root_agent():
     from mfa.runtime.models import make_chat_model
     from mfa.spec import CLOUD_RUN
 
-    spec = load_agent(os.environ.get("MFA_AGENT", "support_agent"))
+    spec = load_agent(os.environ.get("MFA_AGENT", "weather_agent"))
     model = spec.model_for(CLOUD_RUN, os.environ.get("MFA_MODEL"))
     return spec, model, build_agent_graph(spec, make_chat_model(model))

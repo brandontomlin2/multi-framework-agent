@@ -33,7 +33,7 @@ Write an agent once in **LangGraph** style: a prompt, some typed Python tools, a
 ## Layout
 
 ```
-agents/support_agent/        worked example: orders, refunds, policies, escalation; 10 eval cases
+agents/weather_agent/        worked example: today's weather, asks where if you don't say; 11 eval cases
 agents/_template/            copy this to start a new agent
 src/mfa/
   spec.py                    AgentSpec / ToolSpec / @tool: the framework-neutral definition
@@ -74,42 +74,53 @@ Models are set per target in the spec. `cloud_run` reuses the spec's `agent_engi
 
 ```bash
 # Local
-mfa run  support_agent -t local "Where is order ORD-1001?"
-mfa eval support_agent -t local
+mfa run  weather_agent -t local "What's the weather in Paris today?"
+mfa chat weather_agent -t local                      # try "what's the weather today?" → it asks where
+mfa eval weather_agent -t local
 
 # Gemini platform, container (recommended for LangGraph)
-mfa show   support_agent -t cloud_run             # env, entrypoint and requirements that will ship
-mfa build  support_agent -o build/support_agent   # inspect / docker build / agents-cli deploy it yourself
-mfa deploy support_agent -t cloud_run             # gcloud run deploy --source, private by default
-mfa eval   support_agent -t cloud_run
-mfa eval   support_agent -t cloud_run --url http://localhost:8080   # a container you run locally
+mfa show   weather_agent -t cloud_run             # env, entrypoint and requirements that will ship
+mfa build  weather_agent -o build/weather_agent   # inspect / docker build / agents-cli deploy it yourself
+mfa deploy weather_agent -t cloud_run             # gcloud run deploy --source, private by default
+mfa eval   weather_agent -t cloud_run
+mfa eval   weather_agent -t cloud_run --url http://localhost:8080   # a container you run locally
 
 # Gemini platform, Agent Runtime via SDK
-mfa deploy support_agent -t agent_engine
-mfa eval   support_agent -t agent_engine
+mfa deploy weather_agent -t agent_engine
+mfa eval   weather_agent -t agent_engine
 
 # Claude Managed Agents: option A, SDK deploy
-mfa show   support_agent -t claude_managed        # the exact agent config
-mfa deploy support_agent -t claude_managed        # reuses the env by name; redeploy = new agent version
-mfa eval   support_agent -t claude_managed
+mfa show   weather_agent -t claude_managed        # the exact agent config
+mfa deploy weather_agent -t claude_managed        # reuses the env by name; redeploy = new agent version
+mfa eval   weather_agent -t claude_managed
 
 # Claude Managed Agents: option B, version-controlled files with ant apply (Anthropic's recommended control plane)
-mfa export   support_agent -t claude_managed -o deploy/claude_managed
+mfa export   weather_agent -t claude_managed -o deploy/claude_managed
 ant apply --dry-run deploy/claude_managed/support-agent/agent.md deploy/claude_managed/support-agent/environment.yaml
 ant apply --yes     deploy/claude_managed/support-agent/agent.md deploy/claude_managed/support-agent/environment.yaml
-mfa register support_agent -t claude_managed --agent-id agent_... --environment-id env_...   # IDs from claude-lock.json
-mfa eval     support_agent -t claude_managed
+mfa register weather_agent -t claude_managed --agent-id agent_... --environment-id env_...   # IDs from claude-lock.json
+mfa eval     weather_agent -t claude_managed
 
 # Everything that's deployed, side by side, gated for CI
-mfa eval    support_agent -t all --min-pass-rate 0.9   # 'all' = local + every target with a deployment record
-mfa compare eval_results/support_agent/*.json
+mfa eval    weather_agent -t all --min-pass-rate 0.9   # 'all' = local + every target with a deployment record
+mfa compare eval_results/weather_agent/*.json
 
 # Grade any run with Google's tooling as well
-mfa export support_agent -t gemini_eval --report eval_results/support_agent/claude_managed-<ts>.json -o traces.json
+mfa export weather_agent -t gemini_eval --report eval_results/weather_agent/claude_managed-<ts>.json -o traces.json
 agents-cli eval grade --traces traces.json --config eval_config.yaml
 ```
 
 Deploy records live in `.deployments/<agent>.<target>.json`: the Agent Runtime resource name, the Cloud Run URL and A2A card URL, or the CMA agent ID, version and environment. Redeploying updates the same resource. They hold no secrets. Commit them, by removing `.deployments/` from `.gitignore`, if CI or teammates evaluate the same deployments. With `ant apply`, also commit `claude-lock.json`.
+
+## The example agent
+
+`weather_agent` has one tool, `get_weather_today(location)`. It returns today's conditions, the current temperature, today's high and low, and the chance of precipitation, in °F and °C, plus other places with the same name when the name is ambiguous. If the user doesn't say where, the agent asks before calling the tool, and it uses a place given in a later turn.
+
+Weather data comes from `MFA_WEATHER_PROVIDER`:
+- `open-meteo` (default): live data from [Open-Meteo](https://open-meteo.com/). It needs no API key; the hosts are `geocoding-api.open-meteo.com` and `api.open-meteo.com`. On Cloud Run and Agent Runtime the container calls these hosts. On Claude Managed Agents the tool runs in the `mfa` runner, so the CMA sandbox stays without network access.
+- `fixture`: deterministic offline data for Seattle, Paris, Tokyo, London and Portland. The tests always use it. For a fully reproducible eval run, set it where the tool runs: in your shell for `local` and `claude_managed`, and with `MFA_FORWARD_ENV=MFA_WEATHER_PROVIDER` at deploy time for the Gemini targets (`MFA_FORWARD_ENV` copies any listed env vars into the deployed container).
+
+Because live weather changes, the eval cases never assert specific temperatures. The deterministic checks cover behaviour (did it ask where, did it call the tool with the right place, did it report temperatures and units), and the judge checks that the reply matches the tool output it saw.
 
 ## Serving surface (`cloud_run` and `mfa build`)
 
@@ -126,21 +137,21 @@ One `agents/<name>/evals/cases.yaml` is shared by every target:
 
 ```yaml
 cases:
-  - id: refund_within_window
-    tags: [refunds, smoke]
-    input: "I'd like a refund for order ORD-1002."     # or turns: [..] for multi-turn
+  - id: asks_for_location
+    input: "What's the weather like today?"
     expect:
-      tools_called: [check_refund_eligibility]          # trajectory checks
-      tool_args: {check_refund_eligibility: {order_id: ORD-1002}}
-      tools_not_called: [create_support_ticket]
-      no_tool_calls: false
-      max_tool_calls: 4
-      output_contains: ["215"]                          # output checks (case-insensitive)
-      output_contains_any: ["eligible", "refund"]
-      output_not_contains: ["processed"]
-      output_regex: "\\$?215(\\.00)?"
-    judge: >-                                           # optional LLM-as-judge rubric
-      Confirms ORD-1002 is eligible for $215.00 and does not claim it was already processed.
+      no_tool_calls: true                                # it must ask, not guess
+      output_contains_any: ["where", "which city", "location"]
+  - id: location_in_follow_up
+    turns: ["What's the weather today?", "Tokyo"]       # multi-turn
+    expect:
+      tools_called: [get_weather_today]                  # trajectory checks
+      tool_args_contain: {get_weather_today: {location: tokyo}}   # substring; tool_args = exact
+      max_tool_calls: 1
+      output_contains: ["Tokyo"]                         # output checks (case-insensitive)
+      output_regex: "\\d+ ?°"
+    judge: >-                                            # optional LLM-as-judge rubric
+      Gives today's weather for Tokyo, Japan, with temperatures that match the tool output.
 ```
 
 - **Passing:** a case passes when every check passes. A skipped judge (`--no-judge`, or no verdict returned) doesn't fail a case.

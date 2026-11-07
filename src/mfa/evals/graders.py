@@ -58,6 +58,12 @@ def deterministic_checks(exp: Expectations, result: AgentResult) -> list[Check]:
         actual = [c.args for c in result.tool_calls if c.name == tool]
         ok = any(_args_match(expected_args, a) for a in actual)
         checks.append(Check(name=f"args:{tool}", passed=ok, detail=f"expected⊆{expected_args} got={actual}"))
+    for tool, expected_sub in exp.tool_args_contain.items():
+        actual = [c.args for c in result.tool_calls if c.name == tool]
+        ok = any(
+            all(_lc(str(v)) in _lc(str(a.get(k, ""))) for k, v in expected_sub.items()) for a in actual
+        )
+        checks.append(Check(name=f"args_contain:{tool}", passed=ok, detail=f"expected {expected_sub} got={actual}"))
 
     for s in exp.output_contains:
         checks.append(Check(name=f"contains:{s}", passed=_lc(s) in out))
