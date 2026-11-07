@@ -114,7 +114,7 @@ class CloudRunTarget:
         )
 
         with tempfile.TemporaryDirectory(prefix="mfa-run-") as tmp:
-            ctx = build_context(spec, model, tmp)
+            ctx = build_context(spec, model, tmp, agent_ref=agent_ref or spec.name)
             subprocess.run([*cmd, f"--source={ctx}"], check=True)
 
         url = subprocess.run(

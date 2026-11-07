@@ -43,6 +43,9 @@ from mfa.serving.fast_api_app import app  # noqa: F401
 
 DOCKERFILE = """FROM python:{py}-slim
 ENV PYTHONUNBUFFERED=1 PORT=8080 HOST=0.0.0.0
+# Defaults baked in at build time so the served model always matches the packaged
+# provider dependencies; a deploy can still override them with env vars.
+ENV MFA_AGENT={agent} MFA_MODEL={model}
 WORKDIR /code
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -68,7 +71,13 @@ def container_requirements(spec: AgentSpec, model: str) -> list[str]:
     return reqs + list(spec.requirements)
 
 
-def build_context(spec: AgentSpec, model: str, out_dir: str | Path, python_version: str = "3.12") -> Path:
+def build_context(
+    spec: AgentSpec,
+    model: str,
+    out_dir: str | Path,
+    python_version: str = "3.12",
+    agent_ref: str | None = None,
+) -> Path:
     out = Path(out_dir)
     if out.exists():
         shutil.rmtree(out)
@@ -80,6 +89,8 @@ def build_context(spec: AgentSpec, model: str, out_dir: str | Path, python_versi
     (out / "app" / "agent.py").write_text(AGENT_SHIM)
     (out / "app" / "fast_api_app.py").write_text(APP_SHIM)
     (out / "requirements.txt").write_text("\n".join(container_requirements(spec, model)) + "\n")
-    (out / "Dockerfile").write_text(DOCKERFILE.format(py=python_version))
+    (out / "Dockerfile").write_text(
+        DOCKERFILE.format(py=python_version, agent=agent_ref or spec.name, model=model)
+    )
     (out / ".dockerignore").write_text("**/__pycache__\n**/*.pyc\n")
     return out

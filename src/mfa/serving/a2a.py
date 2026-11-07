@@ -34,8 +34,9 @@ def advertised_base_url() -> str:
 class SpecAgentExecutor(AgentExecutor):
     """Bridges an A2A request to the compiled graph; the A2A context id is the LangGraph thread."""
 
-    def __init__(self, graph):
+    def __init__(self, graph, recursion_limit: int):
         self.graph = graph
+        self.recursion_limit = recursion_limit
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         task = context.current_task
@@ -50,7 +51,7 @@ class SpecAgentExecutor(AgentExecutor):
         final_reply = ""
         async for mode, data in self.graph.astream(
             {"messages": [{"role": "user", "content": context.get_user_input()}]},
-            config={"configurable": {"thread_id": task.context_id}},
+            config={"configurable": {"thread_id": task.context_id}, "recursion_limit": self.recursion_limit},
             stream_mode=["messages", "values"],
         ):
             if mode == "messages":
@@ -101,7 +102,10 @@ def agent_card(spec: AgentSpec) -> AgentCard:
 def add_a2a_routes(app: FastAPI, spec: AgentSpec, graph) -> None:
     card = agent_card(spec)
     handler = DefaultRequestHandler(
-        agent_executor=SpecAgentExecutor(graph), task_store=InMemoryTaskStore(), agent_card=card
+        # Same cap as /mfa/query, local and Agent Engine runs.
+        agent_executor=SpecAgentExecutor(graph, recursion_limit=spec.max_iterations * 2 + 1),
+        task_store=InMemoryTaskStore(),
+        agent_card=card,
     )
     add_a2a_routes_to_fastapi(
         app,

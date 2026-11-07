@@ -161,3 +161,34 @@ def test_gemini_eval_export_shape():
     assert t0["events"][2]["content"]["parts"][0]["function_response"]["response"] == {"found": False}
     assert t1["events"][-1]["content"]["parts"][0]["text"] == "done"
     json.dumps(data)
+
+
+def test_built_container_bakes_in_selected_model_and_agent(tmp_path):
+    """The default runtime model must match the provider packages in requirements.txt."""
+    out = build_context(SPEC, "anthropic:claude-opus-5-5", tmp_path / "ctx", agent_ref="support_agent")
+    dockerfile = (out / "Dockerfile").read_text()
+    assert "MFA_MODEL=anthropic:claude-opus-5-5" in dockerfile
+    assert "MFA_AGENT=support_agent" in dockerfile
+    assert "langchain-anthropic" in (out / "requirements.txt").read_text()
+
+
+def test_a2a_route_applies_spec_iteration_limit(monkeypatch):
+    from mfa.serving import load_root_agent
+
+    load_root_agent.cache_clear()
+    monkeypatch.setattr(SPEC, "max_iterations", 2)
+    monkeypatch.setenv("MFA_MODEL", "x:y")
+    looping = [{"tool": "get_order_status", "args": {"order_id": "ORD-1001"}}] * 10 + [{"text": "FINAL"}]
+    monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=looping))
+    from mfa.serving.fast_api_app import create_app
+
+    try:
+        c = TestClient(create_app(), raise_server_exceptions=False)
+        resp = c.post("/a2a/app", json={
+            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "params": {"message": {"kind": "message", "messageId": "m1", "role": "user",
+                                   "parts": [{"kind": "text", "text": "loop"}]}},
+        }).json()
+    finally:
+        load_root_agent.cache_clear()
+    assert "error" in resp and "Recursion limit of 5" in resp["error"]["message"]

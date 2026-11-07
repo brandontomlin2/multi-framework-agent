@@ -167,10 +167,12 @@ def cmd_build(args) -> int:
     from mfa.targets.container import build_context
 
     spec = load_agent(args.agent)
-    out = build_context(spec, spec.model_for(CLOUD_RUN, args.model), args.out or f"build/{spec.name}")
+    out = build_context(
+        spec, spec.model_for(CLOUD_RUN, args.model), args.out or f"build/{spec.name}", agent_ref=args.agent
+    )
     print(f"Container context written to {out}")
     print(f"  docker build -t {spec.name.replace('_', '-')} {out}")
-    print(f"  docker run -p 8080:8080 -e MFA_AGENT={args.agent} {spec.name.replace('_', '-')}")
+    print(f"  docker run -p 8080:8080 {spec.name.replace('_', '-')}   # model + agent are baked in")
     print(f"  mfa eval {args.agent} -t cloud_run --url http://localhost:8080")
     return 0
 
