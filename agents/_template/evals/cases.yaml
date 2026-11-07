@@ -1,0 +1,6 @@
+cases:
+  - id: echo_uses_tool
+    input: "Please repeat exactly: purple elephant"
+    expect:
+      tools_called: [echo]
+      output_contains: ["purple elephant"]

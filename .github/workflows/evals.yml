@@ -1,0 +1,43 @@
+# Live evals against real models/deployments. Run manually; needs repository secrets.
+name: evals
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent:
+        default: support_agent
+      target:
+        description: "local | agent_engine | claude_managed | all (comma list ok)"
+        default: local
+      min_pass_rate:
+        default: "0.9"
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GOOGLE_CLOUD_PROJECT: ${{ vars.GOOGLE_CLOUD_PROJECT }}
+      GOOGLE_CLOUD_LOCATION: ${{ vars.GOOGLE_CLOUD_LOCATION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[all]"
+      - if: contains(inputs.target, 'agent_engine') || inputs.target == 'all'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      # Deployment records (.deployments/*.json) must be available; commit them or
+      # restore them from your own storage before running remote targets.
+      - run: mfa eval ${{ inputs.agent }} --target ${{ inputs.target }} --min-pass-rate ${{ inputs.min_pass_rate }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results
+          path: eval_results/

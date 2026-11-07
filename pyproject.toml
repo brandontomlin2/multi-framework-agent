@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi-framework-agent"
+version = "0.1.0"
+description = "Define an agent once (LangGraph-first), deploy it locally, to Vertex AI Agent Engine, or to Claude Managed Agents, and run the same evals against all three."
+requires-python = ">=3.10"
+dependencies = [
+  "pydantic>=2.7",
+  "pyyaml>=6",
+  "langgraph>=1.0",
+  "langchain-core>=1.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=2.6", "langchain-anthropic>=1.0"]
+vertex = [
+  "google-cloud-aiplatform[agent_engines]>=2.7",
+  "langchain-google-vertexai>=3.0",
+]
+dev = ["pytest>=8"]
+all = ["multi-framework-agent[anthropic,vertex,dev]"]
+
+[project.scripts]
+mfa = "mfa.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["mfa*", "agents*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
