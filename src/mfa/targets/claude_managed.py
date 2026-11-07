@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from mfa import deployments
@@ -174,6 +175,59 @@ class ClaudeManagedRunner:
         return AgentResult(target=self.target, input=user_input, output=final_text, tool_calls=calls, error=error)
 
 
+def environment_params(spec: AgentSpec) -> dict[str, Any]:
+    # Tools run host-side, so the sandbox needs no outbound network.
+    return {"name": f"{spec.name}-env", "config": {"type": "cloud", "networking": {"type": "limited"}}}
+
+
+def _ensure_environment(client: Any, spec: AgentSpec) -> str:
+    """Environment names are unique per workspace, so reuse one that already exists."""
+    params = environment_params(spec)
+    for env in client.beta.environments.list():
+        if env.name == params["name"]:
+            return env.id
+    return client.beta.environments.create(**params).id
+
+
+def write_ant_files(spec: AgentSpec, model: str, out_dir: str | Path) -> list[Path]:
+    """Write the agent + environment as files for ``ant apply`` (Anthropic's recommended control plane).
+
+    Layout: ``<out_dir>/<agent-name>/agent.md`` (frontmatter = config, body = system prompt)
+    and ``environment.yaml``. Run ``ant apply <dir>/agent.md <dir>/environment.yaml`` and then
+    ``mfa register <agent> -t claude_managed --agent-id ... --environment-id ...``.
+    """
+    import yaml
+
+    params = build_agent_params(spec, model)
+    system = params.pop("system")
+    d = Path(out_dir) / spec.name.replace("_", "-")
+    d.mkdir(parents=True, exist_ok=True)
+    front = yaml.safe_dump(params, sort_keys=False, allow_unicode=True)
+    agent_md = d / "agent.md"
+    agent_md.write_text(f"---\n{front}---\n\n{system}")
+    env_yaml = d / "environment.yaml"
+    env_yaml.write_text(yaml.safe_dump(environment_params(spec), sort_keys=False))
+    return [agent_md, env_yaml]
+
+
+def register(spec: AgentSpec, agent_id: str, environment_id: str, client: Any | None = None) -> dict[str, Any]:
+    """Record an agent/environment created elsewhere (``ant apply``, Console) so mfa can run evals on it."""
+    client = client or _client()
+    agent = client.beta.agents.retrieve(agent_id)
+    model = agent.model if isinstance(agent.model, str) else agent.model.id
+    record = {
+        "target": CLAUDE_MANAGED,
+        "agent_id": agent.id,
+        "agent_version": agent.version,
+        "environment_id": environment_id,
+        "model": model,
+        "managed_by": "external",
+        "deployed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    deployments.save(spec.name, CLAUDE_MANAGED, record)
+    return record
+
+
 class ClaudeManagedTarget:
     name = CLAUDE_MANAGED
 
@@ -188,14 +242,7 @@ class ClaudeManagedTarget:
         params = build_agent_params(spec, model)
         existing = deployments.load(spec.name, CLAUDE_MANAGED) or {}
 
-        environment_id = existing.get("environment_id")
-        if not environment_id:
-            # Tools run host-side, so the sandbox needs no outbound network.
-            env = client.beta.environments.create(
-                name=f"{spec.name}-env",
-                config={"type": "cloud", "networking": {"type": "limited"}},
-            )
-            environment_id = env.id
+        environment_id = existing.get("environment_id") or _ensure_environment(client, spec)
 
         if existing.get("agent_id"):
             # This deploy step owns the agent, so update unconditionally; an

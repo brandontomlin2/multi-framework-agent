@@ -22,7 +22,8 @@ class CaseResult(BaseModel):
     tags: list[str] = Field(default_factory=list)
     passed: bool
     checks: list[Check]
-    result: AgentResult
+    result: AgentResult  # all turns combined: last reply, every tool call
+    turns: list[AgentResult] = Field(default_factory=list)  # per-turn detail (used by exports)
 
 
 class EvalReport(BaseModel):
@@ -72,7 +73,7 @@ def run_case(runner: Runner, case: EvalCase, judge: Judge | None) -> CaseResult:
     )
     checks = grade(case, combined, judge)
     passed = all(ch.passed is not False for ch in checks)
-    return CaseResult(case_id=case.id, tags=case.tags, passed=passed, checks=checks, result=combined)
+    return CaseResult(case_id=case.id, tags=case.tags, passed=passed, checks=checks, result=combined, turns=turns)
 
 
 def run_eval(

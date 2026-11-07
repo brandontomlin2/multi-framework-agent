@@ -19,7 +19,12 @@ from langchain_core.tools import BaseTool, StructuredTool
 LOCAL = "local"
 AGENT_ENGINE = "agent_engine"
 CLAUDE_MANAGED = "claude_managed"
-TARGETS = (LOCAL, AGENT_ENGINE, CLAUDE_MANAGED)
+CLOUD_RUN = "cloud_run"  # Gemini platform via a container (Google's recommended path for LangGraph)
+TARGETS = (LOCAL, AGENT_ENGINE, CLOUD_RUN, CLAUDE_MANAGED)
+
+# A target with no model of its own borrows one: both Gemini platform targets
+# serve the same LangGraph graph, so a spec only has to name one Gemini model.
+MODEL_FALLBACKS = {CLOUD_RUN: AGENT_ENGINE}
 
 
 @dataclass(frozen=True)
@@ -108,7 +113,7 @@ class AgentSpec:
         if override:
             return override
         try:
-            return self.models[target]
+            return self.models[target] if target in self.models else self.models[MODEL_FALLBACKS[target]]
         except KeyError as exc:
             raise KeyError(
                 f"Agent {self.name!r} defines no model for target {target!r}; "

@@ -1,108 +1,128 @@
 # multi-framework-agent
 
-Define an agent once, run it locally with **LangGraph**, deploy it to **Gemini Enterprise Agent Platform (Vertex AI Agent Engine)** or **Claude Managed Agents**, and grade every target with the **same eval suite**.
+Write an agent once in **LangGraph** style: a prompt, some typed Python tools, and a set of eval cases. Then run it **locally**, deploy it to **Gemini Enterprise Agent Platform**, or deploy it to **Claude Managed Agents**, and grade every deployment with the **same eval suite**. The base application (`agents/<name>/`) doesn't change between platforms. All the per-platform wiring is generated from the spec at deploy time.
 
 ```
-                    agents/<name>/agent.py  ── AgentSpec (prompt, tools, models, evals)
+                 agents/<name>/  ── agent.py (AgentSpec) · tools.py · evals/cases.yaml   ← your app, never edited per platform
                                  │
-          ┌──────────────────────┼─────────────────────────┐
-          ▼                      ▼                         ▼
-   local (LangGraph)    agent_engine (Vertex AI)    claude_managed (Anthropic)
-   graph runs in-proc   same graph, pickled &       spec translated to agent config;
-                        served by Agent Engine      tools run host-side as custom tools
-          │                      │                         │
-          └──────────── AgentResult (output + tool trajectory) ─┘
+     ┌───────────────────┬───────┴─────────────┬──────────────────────────┐
+     ▼                   ▼                     ▼                          ▼
+  local             agent_engine           cloud_run                 claude_managed
+  LangGraph         Gemini platform:       Gemini platform:          Anthropic: spec → agent config,
+  in-process        Agent Runtime (SDK)    container + A2A           tools run host-side as custom tools
+                    same graph, pickled    agents-cli contract       (SDK deploy, or ant apply files)
+     │                   │                     │                          │
+     └─────────── AgentResult (reply + tool trajectory) ──────────────────┘
                                  ▼
-                 mfa eval: same cases.yaml, same graders, same judge
+             mfa eval: same cases.yaml · same graders · same judge   (+ export to Gemini eval format)
 ```
 
-## How "lift and shift" works
+## Platforms and targets
 
-| Piece | Where it lives | Local | Agent Engine | Claude Managed Agents |
-|---|---|---|---|---|
-| System prompt | `AgentSpec.system_prompt` | LangGraph system message | same graph | agent `system` |
-| Tools | `@tool` functions | `ToolNode` | `ToolNode` (same code ships to GCP) | `custom` tools, executed by the runner with the same functions |
-| Loop | | `mfa.runtime.graph` (model → tools → model) | identical graph via `LangGraphAgentApp.set_up()` | Anthropic's managed loop |
-| Model | `AgentSpec.models[target]` | any `provider:model` | any `provider:model` (Gemini by default) | Claude model ID |
-| Result | `AgentResult` | built from graph messages | returned by `query()` | built from session events |
+| Platform | Target | How the agent gets there | When to use |
+|---|---|---|---|
+| Your machine | `local` | The LangGraph graph runs in-process | Development, CI |
+| Gemini Enterprise Agent Platform | `cloud_run` | Container built from the spec, served with `uvicorn app.fast_api_app:app`, A2A at `/a2a/app` | **Recommended for LangGraph on Gemini platform.** Matches Google's official agents-cli LangChain template |
+| Gemini Enterprise Agent Platform | `agent_engine` | The same graph, pickled and deployed to Agent Runtime (formerly Agent Engine) with the `vertexai` SDK | You specifically need an Agent Runtime resource |
+| Claude Managed Agents | `claude_managed` | Prompt and tools translated into a versioned CMA agent, tools executed host-side | Anthropic-hosted agent loop |
 
-Every target returns the same normalized `AgentResult` (final text and each tool call with its args and output). The eval harness only ever sees that object, so a case means the same thing on every target.
+**Why both Gemini targets.** Google's official [`agents-cli`](https://github.com/google/agents-cli) LangChain extension says LangGraph agents on Agent Runtime are *degraded*: the agent serves requests, but the Console playground can't call it, it can't be published to Gemini, and Console sessions and traces stay empty. Those features need ADK routes. So for LangGraph that skill recommends Cloud Run or GKE over A2A. `cloud_run` follows that contract exactly: `app/agent.py` exports `root_agent`, and `app/fast_api_app.py` exposes `app`. You can also deploy the output of `mfa build` with `agents-cli deploy`, or run it on GKE. `agent_engine` stays available for teams that want an Agent Runtime resource.
 
-**What carries over to Claude Managed Agents:** CMA runs its own agent loop, so the LangGraph graph isn't uploaded there. The portable parts are the prompt and the tools, and those are what the spec holds. If an agent sets a custom LangGraph topology (`AgentSpec.graph_builder`), that topology runs locally and on Agent Engine. On CMA you get the same prompt and tools on Anthropic's loop, and the deploy step prints a note saying so.
-
-**Where CMA tools execute:** tools are registered as `custom` tools, so the `ClaudeManagedRunner` handles each `agent.custom_tool_use` event by calling the same Python function the other targets call. Tool behaviour is identical across targets, and secrets for your tools stay in your process. If you want the agent to work fully unattended with no client in the loop, expose the tools as an MCP server and add it to the agent instead.
+**What carries over to Claude Managed Agents.** CMA runs its own agent loop, so the prompt and tools are what get deployed. The runner answers each `agent.custom_tool_use` event by calling the same Python function the other targets call, so tool behaviour is identical everywhere. If you set a custom LangGraph topology (`AgentSpec.graph_builder`), it runs on `local`, `agent_engine` and `cloud_run`. CMA gets only the prompt and tools, and the deploy prints a note saying so.
 
 ## Layout
 
 ```
+agents/support_agent/        worked example: orders, refunds, policies, escalation; 10 eval cases
+agents/_template/            copy this to start a new agent
 src/mfa/
   spec.py                    AgentSpec / ToolSpec / @tool: the framework-neutral definition
-  registry.py                "support_agent" → agents.support_agent.agent:AGENT
-  runtime/graph.py           the LangGraph template (shared by local + Agent Engine)
+  runtime/graph.py           the LangGraph template (shared by local, agent_engine, cloud_run)
   runtime/models.py          provider:model → LangChain chat model
-  targets/local.py           target 1
-  targets/agent_engine.py    target 2: deploy/update + runner
-  targets/agent_engine_app.py  the object Agent Engine serves (set_up/query)
-  targets/claude_managed.py  target 3: spec→agent translation, deploy/update, session runner
-  evals/                     dataset schema, graders, LLM judge, harness, reports, compare
-  cli.py                     `mfa` command
-agents/support_agent/        worked example (orders, refunds, policies, escalation) + 10 eval cases
-agents/_template/            copy this to start a new agent
-tests/                       offline tests with fake LLM / fake Agent Engine / fake CMA API
+  serving/                   FastAPI + A2A app for containers (agents-cli contract) + /mfa/query
+  targets/local.py           local
+  targets/agent_engine*.py   Gemini platform: Agent Runtime via SDK
+  targets/container.py       generated container build context (app/ shims, Dockerfile, requirements)
+  targets/cloud_run.py       Gemini platform: Cloud Run via `gcloud run deploy --source`
+  targets/claude_managed.py  Claude Managed Agents: translate, deploy/update, ant files, register, runner
+  evals/                     dataset, graders, Claude judge, harness, reports, compare, Gemini export
+  cli.py                     `mfa`
+tests/                       offline: fake LLM, fake Agent Runtime, fake CMA API, in-process A2A server
 ```
 
 ## Setup
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install -e ".[all]"        # or .[anthropic] / .[vertex] for just one provider
+pip install -e ".[all]"        # extras: anthropic, vertex, serving, dev
 pytest -q                      # offline, no credentials needed
 ```
 
-Credentials per target:
-
 | Target | Needs |
 |---|---|
-| `local` | Credentials for the model in `models["local"]`: `ANTHROPIC_API_KEY` for `anthropic:*`, or `gcloud auth application-default login` + `GOOGLE_CLOUD_PROJECT` for `google_vertexai:*` / `anthropic_vertex:*` |
-| `agent_engine` | ADC, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` (default `us-central1`), `MFA_STAGING_BUCKET=gs://...`. Optional `MFA_AGENT_ENGINE_SERVICE_ACCOUNT`. If the Agent Engine model is `anthropic:*`, set `MFA_ANTHROPIC_SECRET` to a Secret Manager secret ID holding the key |
-| `claude_managed` | `ANTHROPIC_API_KEY` (or an `ant auth login` profile) |
-| LLM judge | `ANTHROPIC_API_KEY`. Default judge is `claude-opus-5-5` at low effort, override with `MFA_JUDGE_MODEL`. Use `--no-judge` to run only the deterministic checks |
+| `local` | Credentials for `models["local"]`: `ANTHROPIC_API_KEY` for `anthropic:*`, or ADC + `GOOGLE_CLOUD_PROJECT` for `google_vertexai:*` / `anthropic_vertex:*` |
+| `cloud_run` | `gcloud` logged in, `GOOGLE_CLOUD_PROJECT`. Optional: `MFA_CLOUD_RUN_REGION` (default `us-central1`), `MFA_CLOUD_RUN_SERVICE_ACCOUNT`, `MFA_CLOUD_RUN_ALLOW_UNAUTHENTICATED=1` (off by default, so callers need an identity token; the runner fetches one) |
+| `agent_engine` | ADC, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` (default `us-central1`), `MFA_STAGING_BUCKET=gs://...`. Optional: `MFA_AGENT_ENGINE_SERVICE_ACCOUNT` |
+| `claude_managed` | `ANTHROPIC_API_KEY` (or an `ant auth login` profile). Optional: the `ant` CLI if you use the file-based flow |
+| LLM judge | `ANTHROPIC_API_KEY`. Default judge is `claude-opus-5-5` at low effort, override with `MFA_JUDGE_MODEL`. `--no-judge` runs only the deterministic checks |
 
-Models are set per target in the spec and can be overridden with env vars (`MFA_LOCAL_MODEL`, `MFA_AGENT_ENGINE_MODEL`, `MFA_CLAUDE_MANAGED_MODEL`) or `--model`. The example defaults are Claude Opus 5.5 locally and on CMA, and `gemini-3.1-pro-preview` on Agent Engine, served from the `global` endpoint (`MFA_GEMINI_LOCATION`). Gemini 2.5 was retired on Vertex in October 2026. To run Claude inside Agent Engine, use `anthropic_vertex:claude-opus-5-5`.
+To use a Claude API model inside either Gemini target, set `MFA_ANTHROPIC_SECRET` to a Secret Manager secret holding the key.
+
+Models are set per target in the spec. `cloud_run` reuses the spec's `agent_engine` model unless the spec names one of its own, so existing agents need no change. Overrides: `MFA_LOCAL_MODEL`, `MFA_AGENT_ENGINE_MODEL`, `MFA_CLAUDE_MANAGED_MODEL`, or `--model`. The example defaults are Claude Opus 5.5 locally and on CMA, and `gemini-3.1-pro-preview` on Gemini platform, served from the `global` endpoint (`MFA_GEMINI_LOCATION`). Gemini 2.5 was retired on Vertex in October 2026.
 
 ## Usage
 
 ```bash
-# 1. Local
+# Local
 mfa run  support_agent -t local "Where is order ORD-1001?"
-mfa chat support_agent -t local
 mfa eval support_agent -t local
 
-# 2. Gemini Enterprise Agent Platform / Vertex AI Agent Engine
-mfa show   support_agent -t agent_engine          # requirements + model that will ship
-mfa deploy support_agent -t agent_engine          # create, or update if already deployed
+# Gemini platform, container (recommended for LangGraph)
+mfa show   support_agent -t cloud_run             # env, entrypoint and requirements that will ship
+mfa build  support_agent -o build/support_agent   # inspect / docker build / agents-cli deploy it yourself
+mfa deploy support_agent -t cloud_run             # gcloud run deploy --source, private by default
+mfa eval   support_agent -t cloud_run
+mfa eval   support_agent -t cloud_run --url http://localhost:8080   # a container you run locally
+
+# Gemini platform, Agent Runtime via SDK
+mfa deploy support_agent -t agent_engine
 mfa eval   support_agent -t agent_engine
 
-# 3. Claude Managed Agents
-mfa show   support_agent -t claude_managed        # the exact agent config that will be created
-mfa deploy support_agent -t claude_managed        # creates env + agent; redeploy = new agent version
+# Claude Managed Agents: option A, SDK deploy
+mfa show   support_agent -t claude_managed        # the exact agent config
+mfa deploy support_agent -t claude_managed        # reuses the env by name; redeploy = new agent version
 mfa eval   support_agent -t claude_managed
 
-# All three, side by side, gated for CI
-mfa deploy support_agent -t agent_engine,claude_managed
-mfa eval   support_agent -t all --min-pass-rate 0.9
+# Claude Managed Agents: option B, version-controlled files with ant apply (Anthropic's recommended control plane)
+mfa export   support_agent -t claude_managed -o deploy/claude_managed
+ant apply --dry-run deploy/claude_managed/support-agent/agent.md deploy/claude_managed/support-agent/environment.yaml
+ant apply --yes     deploy/claude_managed/support-agent/agent.md deploy/claude_managed/support-agent/environment.yaml
+mfa register support_agent -t claude_managed --agent-id agent_... --environment-id env_...   # IDs from claude-lock.json
+mfa eval     support_agent -t claude_managed
+
+# Everything that's deployed, side by side, gated for CI
+mfa eval    support_agent -t all --min-pass-rate 0.9   # 'all' = local + every target with a deployment record
 mfa compare eval_results/support_agent/*.json
+
+# Grade any run with Google's tooling as well
+mfa export support_agent -t gemini_eval --report eval_results/support_agent/claude_managed-<ts>.json -o traces.json
+agents-cli eval grade --traces traces.json --config eval_config.yaml
 ```
 
-Useful eval flags: `--tag smoke`, `--case refund_within_window`, `--no-judge`, `--concurrency 8`, `--out dir`.
+Deploy records live in `.deployments/<agent>.<target>.json`: the Agent Runtime resource name, the Cloud Run URL and A2A card URL, or the CMA agent ID, version and environment. Redeploying updates the same resource. They hold no secrets. Commit them, by removing `.deployments/` from `.gitignore`, if CI or teammates evaluate the same deployments. With `ant apply`, also commit `claude-lock.json`.
 
-Deploys write `.deployments/<agent>.<target>.json` (Agent Engine resource name, or CMA agent ID, version, and environment ID). Redeploying updates the same resource instead of creating a new one. For CMA, each redeploy that changes the spec creates a new immutable agent version, and eval sessions pin to the recorded version. These files hold no secrets. Commit them, by removing `.deployments/` from `.gitignore`, if CI or teammates need to evaluate the same deployments.
+## Serving surface (`cloud_run` and `mfa build`)
 
-Each eval run writes `eval_results/<agent>/<target>-<timestamp>.{json,md}`. The JSON holds every case's checks, the full tool trajectory, latency, and CMA session IDs, which you can open in the Console session viewer.
+| Route | Purpose |
+|---|---|
+| `POST /a2a/app` | A2A JSON-RPC (v1.0, plus v0.3 compatibility). The A2A context ID is the LangGraph thread |
+| `GET /a2a/app/.well-known/agent-card.json` | Agent card. One skill per tool. `APP_URL` is set to the service URL after deploy |
+| `POST /mfa/query` | `{"input", "thread_id"}` → the normalized `AgentResult` (reply + tool trajectory) the eval harness grades |
+| `GET /health` | Liveness, agent name, model |
 
-## Writing evals
+## Evals
 
-`agents/<name>/evals/cases.yaml` is shared by all targets:
+One `agents/<name>/evals/cases.yaml` is shared by every target:
 
 ```yaml
 cases:
@@ -123,7 +143,9 @@ cases:
       Confirms ORD-1002 is eligible for $215.00 and does not claim it was already processed.
 ```
 
-A case passes when every check passes. A skipped judge (`--no-judge`, or the judge returned no verdict) doesn't fail the case. Reports give the case pass rate, check pass rate, judge pass rate, error count, p50 latency, and average tool calls.
+- **Passing:** a case passes when every check passes. A skipped judge (`--no-judge`, or no verdict returned) doesn't fail a case.
+- **Reports:** `eval_results/<agent>/<target>-<timestamp>.{json,md}` record per-case checks, per-turn tool trajectories, latency, and CMA session IDs (which you can open in the Console session viewer).
+- **Gemini format:** `mfa export -t gemini_eval` converts any report, from any target, into the Gemini platform `EvaluationDataset` shape (`eval_cases[].agent_data.turns[].events[]`, with `function_call` / `function_response` parts). The rubric and mfa's own checks travel as extra fields for custom metrics.
 
 ## Plugging in your own agent
 
@@ -131,17 +153,22 @@ A case passes when every check passes. A skipped judge (`--no-judge`, or the jud
 cp -r agents/_template agents/my_agent
 ```
 
-1. In `tools.py`, write typed functions with Google-style `Args:` docstrings and decorate them with `@tool`. The JSON schema for every framework is generated from these. List any extra pip dependencies in `AgentSpec.requirements` so they ship to Agent Engine.
+1. In `tools.py`, write typed functions with Google-style `Args:` docstrings and decorate them with `@tool`. The JSON schema for every platform comes from these. List extra pip dependencies in `AgentSpec.requirements`; they ship to both Gemini targets.
 2. In `agent.py`, set the prompt, tools, per-target models and `eval_dataset`, and export `AGENT`. Fix the `agents._template...` import.
 3. In `evals/cases.yaml`, write the cases.
-4. Run `mfa eval my_agent -t local`, then `mfa deploy my_agent -t agent_engine,claude_managed`, then `mfa eval my_agent -t all`.
+4. Run `mfa eval my_agent -t local`, then `mfa deploy my_agent -t cloud_run,claude_managed`, then `mfa eval my_agent -t all`.
 
-To use an existing LangGraph graph, set `AgentSpec.graph_builder=lambda spec, model, *, checkpointer: <compiled graph>`. Its state needs a `messages` key. Local and Agent Engine run your graph as-is, and CMA gets the prompt and tools.
+Bringing an existing LangGraph graph: set `AgentSpec.graph_builder=lambda spec, model, *, checkpointer: <compiled graph>`. Its state needs a `messages` key. That graph is what `local`, `agent_engine` and `cloud_run` serve.
 
 ## Notes and limits
 
-- **Agent Engine state:** the deployed app uses LangGraph's `InMemorySaver`, so multi-turn threads live on one serving instance. Swap in a persistent checkpointer in `LangGraphAgentApp.set_up()` for production multi-turn traffic.
-- **Agent Engine packaging:** `mfa deploy` copies `src/mfa` and `agents/` into a staging directory and ships them as `extra_packages`. It pins LangGraph, LangChain and the aiplatform SDK to your local versions so the pickled app loads remotely. Run deploys from a repo checkout (`pip install -e .`).
-- **CMA sandbox:** the environment is created with `limited` networking and no allowed hosts, because tools run host-side. The built-in toolset (bash, files) is off so the agent has exactly the spec's tools. Set `MFA_CMA_ENABLE_TOOLSET=1` to add it, with web tools still off. Any tool call the server pauses for approval during an eval is denied.
+- **Conversation state:** the LangGraph targets use `InMemorySaver`, so a multi-turn thread lives on one serving instance. For production multi-turn traffic, swap in a persistent checkpointer in `mfa.serving.load_root_agent` / `LangGraphAgentApp.set_up()`.
+- **Packaging:** both Gemini targets copy `src/mfa` and `agents/` and pin LangGraph, LangChain and SDK versions to your local install. Run deploys from a repo checkout (`pip install -e .`).
+- **CMA sandbox:** `limited` networking with no allowed hosts, because tools run host-side. The built-in toolset is off so the agent has exactly the spec's tools. `MFA_CMA_ENABLE_TOOLSET=1` adds it, with web tools still off. Any tool call the server pauses for approval during an eval is denied. Environment names are unique per workspace, so a deploy reuses `<agent>-env` if it exists.
 - **CMA turn timeout:** `MFA_CMA_TURN_TIMEOUT_S` (default 600). It is checked as events arrive, and the turn is interrupted when it is exceeded.
 - **Cost:** live evals call real models. A full run is 10 cases per target plus one judge call per case.
+
+## References
+
+- Google [`agents-cli`](https://github.com/google/agents-cli): LangChain extension (`extensions/langchain`), deploy and eval skills
+- Anthropic [`launch-your-agent`](https://github.com/anthropics/launch-your-agent) and [`skills`](https://github.com/anthropics/skills): Claude Managed Agents primitives, `ant apply`, outcome rubrics

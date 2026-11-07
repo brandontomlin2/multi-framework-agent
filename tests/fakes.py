@@ -52,11 +52,13 @@ class FakeCMAClient:
     def __init__(self, script: list[dict[str, Any]] | None = None):
         self.script = list(script or [])
         self.sent: list[dict[str, Any]] = []
+        self.existing_envs: list[Any] = []
+        self.env_creates = 0
         self.created_agents: list[dict[str, Any]] = []
         self.updated_agents: list[tuple[str, dict[str, Any]]] = []
         self.beta = SimpleNamespace(
-            environments=SimpleNamespace(create=self._env_create),
-            agents=SimpleNamespace(create=self._agent_create, update=self._agent_update),
+            environments=SimpleNamespace(create=self._env_create, list=lambda **kw: list(self.existing_envs)),
+            agents=SimpleNamespace(create=self._agent_create, update=self._agent_update, retrieve=self._agent_retrieve),
             sessions=SimpleNamespace(
                 create=self._session_create,
                 events=SimpleNamespace(stream=self._stream, send=self._send),
@@ -67,12 +69,16 @@ class FakeCMAClient:
 
     # control plane
     def _env_create(self, **kw):
-        return SimpleNamespace(id="env_fake")
+        self.env_creates += 1
+        return SimpleNamespace(id="env_fake", name=kw["name"])
 
     def _agent_create(self, **kw):
         self.created_agents.append(kw)
         self._version = 1
         return SimpleNamespace(id="agent_fake", version=self._version)
+
+    def _agent_retrieve(self, agent_id, **kw):
+        return SimpleNamespace(id=agent_id, version=7, model=SimpleNamespace(id="claude-opus-5-5"))
 
     def _agent_update(self, agent_id, **kw):
         self.updated_agents.append((agent_id, kw))

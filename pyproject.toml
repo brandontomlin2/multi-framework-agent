@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "multi-framework-agent"
 version = "0.1.0"
-description = "Define an agent once (LangGraph-first), deploy it locally, to Vertex AI Agent Engine, or to Claude Managed Agents, and run the same evals against all three."
+description = "Define an agent once (LangGraph-first), deploy it locally, to Gemini Enterprise Agent Platform, or to Claude Managed Agents, and run the same evals against all of them."
 requires-python = ">=3.10"
 dependencies = [
   "pydantic>=2.7",
@@ -20,8 +20,9 @@ vertex = [
   "google-cloud-aiplatform[agent_engines]>=2.7",
   "langchain-google-vertexai>=3.0",
 ]
-dev = ["pytest>=8"]
-all = ["multi-framework-agent[anthropic,vertex,dev]"]
+serving = ["fastapi>=0.115", "uvicorn>=0.34", "a2a-sdk[http-server]>=1.0,<2"]
+dev = ["pytest>=8", "httpx>=0.27"]
+all = ["multi-framework-agent[anthropic,vertex,serving,dev]"]
 
 [project.scripts]
 mfa = "mfa.cli:main"
