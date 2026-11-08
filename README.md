@@ -33,7 +33,7 @@ Write an agent once in **LangGraph** style: a prompt, some typed Python tools, a
 ## Layout
 
 ```
-agents/weather_agent/        worked example: today's weather, asks where if you don't say; 15 eval cases
+agents/weather_agent/        worked example: today's weather, asks where if you don't say; 19 eval cases
   skills/weather-briefing/   an Agent Skill (SKILL.md + references/ + scripts/) the agent reads on demand
 agents/_template/            copy this to start a new agent
 src/mfa/
@@ -122,6 +122,8 @@ Deploy records live in `.deployments/<agent>.<target>.json`: the Agent Runtime r
 ## The example agent
 
 `weather_agent` has one tool, `get_weather_today(location)`. It returns today's conditions, the current temperature, today's high and low, and the chance of precipitation, in °F and °C, plus other places with the same name when the name is ambiguous. If the user doesn't say where, the agent asks before calling the tool, and it uses a place given in a later turn.
+
+Its cases also cover two cities asked in one message (parallel tool calls), a correction in a follow-up turn, shouted input and two questions answered by one call.
 
 It also has one skill, `skills/weather-briefing/`: when the user asks what to wear, whether to bring an umbrella, or for a briefing of their day, the agent reads `SKILL.md`, then `references/clothing-guide.md`, and answers in the skill's three-line shape with the guide's wording. The `skill`-tagged eval cases check that the skill is read on demand (`skills_used`) and that a plain forecast leaves it alone (`skills_not_used`). The fixture cities exercise every clothing band deterministically. `scripts/briefing_lines.py` produces the same lines from the command line; it runs only when an agent opts into `allow_skill_scripts`.
 
@@ -231,6 +233,7 @@ cases:
 - **Trials:** `--trials N` runs every case N times. The table shows `passed/runs` per case and `mfa compare` says whether two targets' pass-rate intervals overlap. The 95% Wilson interval is computed over *cases* (trials refine each case's pass estimate but are not independent samples, so they never shrink the interval); more distinct cases are what narrows it.
 - **Environment:** every report records the non-secret `MFA_*` variables in effect (for example `MFA_WEATHER_PROVIDER`), so a cross-target difference can be traced to data, not only to the platform.
 - **Skills:** `skills_used: [name]` passes when the skill's `SKILL.md` was read during the case (any root, any target); `skills_not_used` is the opposite. Tool expectations may name the skill tools (`read`, `glob`, `grep`, `bash`) like any other tool.
+- **Several calls to one tool:** `tool_calls: [{tool, args | args_contain}, ...]` requires a distinct matching call for every entry (two cities asked in one message, a correction in a later turn), which `tool_args` alone cannot express.
 - **Reports:** `eval_results/<agent>/<target>-<timestamp>.{json,md}` record per-case checks, per-turn tool trajectories, latency, and CMA session IDs (which you can open in the Console session viewer).
 - **Gemini format:** `mfa export -t gemini_eval` converts any report, from any target, into the Gemini platform `EvaluationDataset` shape (`eval_cases[].agent_data.turns[].events[]`, with `function_call` / `function_response` parts). The rubric and mfa's own checks travel as extra fields for custom metrics.
 
@@ -256,8 +259,12 @@ Bringing an existing LangGraph graph: set `AgentSpec.graph_builder=lambda spec, 
 - **CMA turn timeout:** `MFA_CMA_TURN_TIMEOUT_S` (default 600). It is checked as events arrive, and the turn is interrupted when it is exceeded.
 - **Capability knobs:** `MFA_EFFORT` (overrides `AgentSpec.effort` on every target), `MFA_SKILLS_ROOT` (virtual skill root announced to the model, default `/workspace/skills`), `MFA_ANTHROPIC_SKILLS_DIR` (checkout of `anthropics/skills` to mirror Anthropic skills locally), `MFA_GEMINI_THINKING_BUDGET` (replaces the effort→budget mapping for Gemini), `MFA_CMA_SKILL_VERSION=latest` (attach `latest` instead of the uploaded version id), `MFA_CMA_SPEED`, `MFA_CMA_INFERENCE_GEO`.
 - **Cloud Run runner:** the identity token is refreshed before it expires (and once on a 401). Only failures that prove the request never reached the app are retried (connection refused, DNS, 429, 503), `MFA_CLOUD_RUN_RETRIES` times (default 3) with backoff; read timeouts and other 5xx are not, because a retry would run the same turn twice on the thread. The client timeout (960 s) is longer than the service's 900 s so the client never gives up first.
-- **Cost:** live evals call real models. A full run is 15 cases per target per trial plus one judge call per case.
+- **Cost:** live evals call real models. A full run is 19 cases per target per trial plus one judge call per case.
 - **Live runs:** pin the tool's data source when comparing targets (`MFA_WEATHER_PROVIDER=fixture` for the example agent; the `evals.yml` default). With live Open-Meteo data, a burst of concurrent calls can be rate-limited or time out, and every such case fails on whichever target it hits, which says nothing about the platform. The first live run of this repo scored 11/15 and 9/15 for exactly that reason and 15/15 on both targets with the fixture.
+
+## Hand-off and edge cases
+
+`docs/HANDOFF.md` is the state of the project (what is verified live, credentials, gotchas, review history, backlog); `docs/EDGE_CASES.md` is the catalogue of agent behaviours to cover next, derived from Google's agent examples.
 
 ## References
 

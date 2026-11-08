@@ -80,6 +80,22 @@ def deterministic_checks(exp: Expectations, result: AgentResult) -> list[Check]:
         for name in exp.skills_not_used:
             checks.append(Check(name=f"skill_not:{name}", passed=name not in used, detail=f"skills read={used}"))
 
+    if exp.tool_calls:
+        # Greedy matching of expected calls to distinct actual calls, in order.
+        unmatched = list(result.tool_calls)
+        for i, want in enumerate(exp.tool_calls):
+            hit = next(
+                (c for c in unmatched if c.name == want.tool and _args_match(want.args, c.args)
+                 and all(_lc(str(v)) in _lc(str(c.args.get(k, ""))) for k, v in want.args_contain.items())),
+                None,
+            )
+            if hit is not None:
+                unmatched.remove(hit)
+            checks.append(Check(
+                name=f"call[{i}]:{want.tool}", passed=hit is not None,
+                detail=f"expected {want.args or want.args_contain} among {[(c.name, c.args) for c in result.tool_calls]}",
+            ))
+
     for s in exp.output_contains:
         checks.append(Check(name=f"contains:{s}", passed=_lc(s) in out))
     if exp.output_contains_any:

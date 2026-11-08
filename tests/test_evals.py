@@ -28,7 +28,8 @@ def test_shared_dataset_is_valid():
     tool_names = set(spec.runtime_tool_names())  # the agent's tools plus the skill file tools
     skill_names = {sk.name for sk in spec.skills}
     for c in cases:
-        for name in [*c.expect.tools_called, *c.expect.tools_not_called, *c.expect.tool_args, *c.expect.tool_args_contain]:
+        for name in [*c.expect.tools_called, *c.expect.tools_not_called, *c.expect.tool_args, *c.expect.tool_args_contain,
+                     *(e.tool for e in c.expect.tool_calls)]:
             assert name in tool_names, f"{c.id} references unknown tool {name}"
         for name in [*c.expect.skills_used, *c.expect.skills_not_used]:
             assert name in skill_names, f"{c.id} references unknown skill {name}"
@@ -214,3 +215,15 @@ def test_skill_checks_look_at_which_skill_md_was_read():
         ToolCall(name="read", args={"file_path": "other-skill/SKILL.md"})])
     assert {c.name: c.passed for c in deterministic_checks(case.expect, wrong)}.items() >= {
         "skill:weather-briefing": False, "skill_not:other-skill": False}.items()
+
+
+def test_tool_calls_expectation_needs_distinct_matching_calls():
+    exp = {"tool_calls": [{"tool": "w", "args_contain": {"location": "paris"}}, {"tool": "w", "args_contain": {"location": "tokyo"}}]}
+    case = EvalCase.model_validate({"id": "p", "input": "q", "expect": exp})
+    both = AgentResult(target="t", input="q", output="", tool_calls=[
+        ToolCall(name="w", args={"location": "Paris, France"}), ToolCall(name="w", args={"location": "Tokyo"})])
+    assert all(c.passed for c in deterministic_checks(case.expect, both) if c.name.startswith("call["))
+    twice_paris = AgentResult(target="t", input="q", output="", tool_calls=[
+        ToolCall(name="w", args={"location": "Paris"}), ToolCall(name="w", args={"location": "Paris"})])
+    names = {c.name: c.passed for c in deterministic_checks(case.expect, twice_paris)}
+    assert names["call[0]:w"] is True and names["call[1]:w"] is False  # the same call cannot satisfy both

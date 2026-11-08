@@ -108,6 +108,61 @@ cases:
       The reply says no matching place was found and asks for a nearby city or a more
       specific name. It does not invent a forecast.
 
+  # --- harder shapes: several places, corrections, odd input ---------------
+  - id: two_cities_in_parallel
+    tags: [weather, parallel]
+    input: "Compare today's weather in Paris and Tokyo for me."
+    expect:
+      tools_called: [get_weather_today]
+      tool_calls:
+        - {tool: get_weather_today, args_contain: {location: paris}}
+        - {tool: get_weather_today, args_contain: {location: tokyo}}
+      max_tool_calls: 2
+      output_contains: ["Paris", "Tokyo", "°"]
+    judge: >-
+      The reply covers both Paris and Tokyo with today's conditions and temperatures for each,
+      every number matching the respective tool output, and says which city is warmer or how
+      they differ. It does not mix the two cities' numbers up.
+
+  - id: correction_in_follow_up
+    tags: [location, multi_turn]
+    turns:
+      - "What's the weather in Paris today?"
+      - "Sorry, I meant Portland, Oregon, not Paris."
+    expect:
+      tool_calls:
+        - {tool: get_weather_today, args_contain: {location: paris}}
+        - {tool: get_weather_today, args_contain: {location: portland}}
+      output_contains: ["Portland"]
+      output_not_contains: ["Paris,"]
+    judge: >-
+      The final reply gives today's weather for Portland, Oregon (not Paris), with numbers that
+      match the second tool output, and does not present Paris's numbers as Portland's.
+
+  - id: shouted_city
+    tags: [weather, input]
+    input: "WEATHER IN LONDON TODAY???"
+    expect:
+      tools_called: [get_weather_today]
+      tool_args_contain: {get_weather_today: {location: london}}
+      max_tool_calls: 1
+      output_contains: ["London", "°"]
+    judge: >-
+      The reply gives today's weather for London with numbers matching the tool output, in a
+      normal tone, despite the shouted question.
+
+  - id: two_questions_one_city
+    tags: [weather]
+    input: "Will it rain in Seattle today, and what's the high going to be?"
+    expect:
+      tools_called: [get_weather_today]
+      tool_args_contain: {get_weather_today: {location: seattle}}
+      max_tool_calls: 1
+      output_contains: ["Seattle", "%", "°"]
+    judge: >-
+      One tool call answers both questions: the reply gives the chance of rain and today's high
+      for Seattle, both matching the tool output.
+
   # --- the weather-briefing skill ------------------------------------------
   # These cases prove the skill is loaded on demand on every target: the model
   # reads skills/weather-briefing/SKILL.md, then references/clothing-guide.md,
