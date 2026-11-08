@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# multi-framework-agent
+.venv/
+.deployments/
+eval_results/
+build/

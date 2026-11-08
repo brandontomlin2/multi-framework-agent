@@ -1,0 +1,66 @@
+# Live evals against real models/deployments. Run manually; needs repository secrets.
+name: evals
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent:
+        default: weather_agent
+      target:
+        description: "local | agent_engine | cloud_run | claude_managed | all (comma list ok)"
+        default: local
+      min_pass_rate:
+        default: "0.9"
+      trials:
+        description: "runs per case; >1 adds a confidence interval to the pass rate"
+        default: "1"
+      extra_env:
+        description: "KEY=VALUE pairs (space separated) exported before the run, e.g. to pin tool data sources"
+        default: "MFA_WEATHER_PROVIDER=fixture"
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GOOGLE_CLOUD_PROJECT: ${{ vars.GOOGLE_CLOUD_PROJECT }}
+      GOOGLE_CLOUD_LOCATION: ${{ vars.GOOGLE_CLOUD_LOCATION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[all]"
+      - if: contains(inputs.target, 'agent_engine') || contains(inputs.target, 'cloud_run') || inputs.target == 'all'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      # cloud_run evals mint an identity token for the private service; gcloud is the fallback minter.
+      - if: contains(inputs.target, 'cloud_run') || inputs.target == 'all'
+        uses: google-github-actions/setup-gcloud@v2
+      # Deployment records (.deployments/*.json) must be available; commit them or
+      # restore them from your own storage before running remote targets.
+      - name: eval
+        env:
+          # Inputs reach the shell as variables, never as script text (no injection, no globbing).
+          AGENT: ${{ inputs.agent }}
+          TARGET: ${{ inputs.target }}
+          MIN_PASS_RATE: ${{ inputs.min_pass_rate }}
+          TRIALS: ${{ inputs.trials }}
+          EXTRA_ENV: ${{ inputs.extra_env }}
+          # Only this step sees the key; dependency installation above does not.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -f
+          for kv in $EXTRA_ENV; do
+            case "$kv" in MFA_*=*) export "$kv" ;; *) echo "ignoring extra_env entry '$kv' (only MFA_*=... is allowed)" ;; esac
+          done
+          mfa eval "$AGENT" --target "$TARGET" --min-pass-rate "$MIN_PASS_RATE" --trials "$TRIALS"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results
+          path: eval_results/
