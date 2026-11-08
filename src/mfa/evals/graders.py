@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from mfa.evals.dataset import EvalCase, Expectations
 from mfa.runtime.result import AgentResult
+from mfa.skills import skills_used
 
 
 class Check(BaseModel):
@@ -71,6 +72,13 @@ def deterministic_checks(exp: Expectations, result: AgentResult) -> list[Check]:
             all(_lc(str(v)) in _lc(str(a.get(k, ""))) for k, v in expected_sub.items()) for a in actual
         )
         checks.append(Check(name=f"args_contain:{tool}", passed=ok, detail=f"expected {expected_sub} got={actual}"))
+
+    if exp.skills_used or exp.skills_not_used:
+        used = skills_used(result.tool_calls)
+        for name in exp.skills_used:
+            checks.append(Check(name=f"skill:{name}", passed=name in used, detail=f"skills read={used}"))
+        for name in exp.skills_not_used:
+            checks.append(Check(name=f"skill_not:{name}", passed=name not in used, detail=f"skills read={used}"))
 
     for s in exp.output_contains:
         checks.append(Check(name=f"contains:{s}", passed=_lc(s) in out))

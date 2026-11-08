@@ -25,10 +25,14 @@ def test_shared_dataset_is_valid():
     spec = load_agent("weather_agent")
     cases = load_cases(spec.eval_dataset)
     assert len(cases) >= 10
-    tool_names = {t.name for t in spec.tools}
+    tool_names = set(spec.runtime_tool_names())  # the agent's tools plus the skill file tools
+    skill_names = {sk.name for sk in spec.skills}
     for c in cases:
         for name in [*c.expect.tools_called, *c.expect.tools_not_called, *c.expect.tool_args, *c.expect.tool_args_contain]:
             assert name in tool_names, f"{c.id} references unknown tool {name}"
+        for name in [*c.expect.skills_used, *c.expect.skills_not_used]:
+            assert name in skill_names, f"{c.id} references unknown skill {name}"
+    assert [c.id for c in load_cases(spec.eval_dataset, tags=["skill"])]
     assert load_cases(spec.eval_dataset, tags=["smoke"])
     assert [c.id for c in load_cases(spec.eval_dataset, ids=["asks_for_location"])] == ["asks_for_location"]
 
@@ -197,3 +201,16 @@ def test_cli_gate_fails_on_ungraded_checks_only_when_gated(monkeypatch, tmp_path
     assert cli.main([*base, "--min-pass-rate", "0.5"]) == 1  # gated run: an ungraded check is not a pass
     assert "could not be graded" in capsys.readouterr().err
     assert cli.main([*base, "--min-pass-rate", "0.5", "--allow-ungraded"]) == 0
+
+
+def test_skill_checks_look_at_which_skill_md_was_read():
+    exp = {"skills_used": ["weather-briefing"], "skills_not_used": ["other-skill"]}
+    case = EvalCase.model_validate({"id": "s", "input": "q", "expect": exp})
+    used = AgentResult(target="t", input="q", output="ok", tool_calls=[
+        ToolCall(name="read", args={"file_path": "/mnt/anywhere/weather-briefing/SKILL.md"})])
+    assert {c.name: c.passed for c in deterministic_checks(case.expect, used)}.items() >= {
+        "skill:weather-briefing": True, "skill_not:other-skill": True}.items()
+    wrong = AgentResult(target="t", input="q", output="ok", tool_calls=[
+        ToolCall(name="read", args={"file_path": "other-skill/SKILL.md"})])
+    assert {c.name: c.passed for c in deterministic_checks(case.expect, wrong)}.items() >= {
+        "skill:weather-briefing": False, "skill_not:other-skill": False}.items()

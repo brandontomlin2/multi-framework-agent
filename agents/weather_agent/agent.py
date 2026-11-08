@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from mfa import AGENT_ENGINE, CLAUDE_MANAGED, LOCAL, AgentSpec
+from mfa import AGENT_ENGINE, CLAUDE_MANAGED, LOCAL, AgentSpec, local_skills
 
 from agents.weather_agent.tools import TOOLS
 
@@ -49,5 +49,9 @@ AGENT = AgentSpec(
         CLAUDE_MANAGED: os.environ.get("MFA_CLAUDE_MANAGED_MODEL", "claude-opus-5-5"),
     },
     eval_dataset=str(Path(__file__).parent / "evals" / "cases.yaml"),
-    max_iterations=4,
+    # Agent Skills: folders under skills/<name>/ with a SKILL.md. The model sees their
+    # names and descriptions and reads one when a task matches (what to wear, umbrella).
+    skills=local_skills(Path(__file__).parent / "skills"),
+    # A briefing is three rounds: weather, SKILL.md, the clothing guide.
+    max_iterations=6,
 )

@@ -28,15 +28,17 @@ Write an agent once in **LangGraph** style: a prompt, some typed Python tools, a
 
 **Why both Gemini targets.** Google's official [`agents-cli`](https://github.com/google/agents-cli) LangChain extension says LangGraph agents on Agent Runtime are *degraded*: the agent serves requests, but the Console playground can't call it, it can't be published to Gemini, and Console sessions and traces stay empty. Those features need ADK routes. So for LangGraph that skill recommends Cloud Run or GKE over A2A. `cloud_run` follows that contract exactly: `app/agent.py` exports `root_agent`, and `app/fast_api_app.py` exposes `app`. You can also deploy the output of `mfa build` with `agents-cli deploy`, or run it on GKE. `agent_engine` stays available for teams that want an Agent Runtime resource.
 
-**What carries over to Claude Managed Agents.** CMA runs its own agent loop, so the prompt and tools are what get deployed. The runner answers each `agent.custom_tool_use` event by calling the same Python function the other targets call, so tool behaviour is identical everywhere. If you set a custom LangGraph topology (`AgentSpec.graph_builder`), it runs on `local`, `agent_engine` and `cloud_run`. CMA gets only the prompt and tools, and the deploy prints a note saying so.
+**What carries over to Claude Managed Agents.** CMA runs its own agent loop, so the prompt, tools, skills and model effort are what get deployed. The runner answers each `agent.custom_tool_use` event by calling the same Python function the other targets call, so tool behaviour is identical everywhere; skills are uploaded with the Skills API and read through CMA's built-in file tools, which the runner approves with the same rules the LangGraph targets enforce (see *Agent Skills* below). If you set a custom LangGraph topology (`AgentSpec.graph_builder`), it runs on `local`, `agent_engine` and `cloud_run`. CMA gets only the prompt, tools and skills, and the deploy prints a note saying so.
 
 ## Layout
 
 ```
-agents/weather_agent/        worked example: today's weather, asks where if you don't say; 11 eval cases
+agents/weather_agent/        worked example: today's weather, asks where if you don't say; 15 eval cases
+  skills/weather-briefing/   an Agent Skill (SKILL.md + references/ + scripts/) the agent reads on demand
 agents/_template/            copy this to start a new agent
 src/mfa/
-  spec.py                    AgentSpec / ToolSpec / @tool: the framework-neutral definition
+  spec.py                    AgentSpec / ToolSpec / SkillSpec, @tool, skill(), local_skills(): the framework-neutral definition
+  skills.py                  skills on LangGraph: virtual root, read/glob/grep(/bash) tools, prompt block; also gates CMA built-ins
   runtime/graph.py           the LangGraph template (shared by local, agent_engine, cloud_run)
   runtime/models.py          provider:model → LangChain chat model
   serving/                   FastAPI + A2A app for containers (agents-cli contract) + /mfa/query
@@ -121,6 +123,8 @@ Deploy records live in `.deployments/<agent>.<target>.json`: the Agent Runtime r
 
 `weather_agent` has one tool, `get_weather_today(location)`. It returns today's conditions, the current temperature, today's high and low, and the chance of precipitation, in °F and °C, plus other places with the same name when the name is ambiguous. If the user doesn't say where, the agent asks before calling the tool, and it uses a place given in a later turn.
 
+It also has one skill, `skills/weather-briefing/`: when the user asks what to wear, whether to bring an umbrella, or for a briefing of their day, the agent reads `SKILL.md`, then `references/clothing-guide.md`, and answers in the skill's three-line shape with the guide's wording. The `skill`-tagged eval cases check that the skill is read on demand (`skills_used`) and that a plain forecast leaves it alone (`skills_not_used`). The fixture cities exercise every clothing band deterministically. `scripts/briefing_lines.py` produces the same lines from the command line; it runs only when an agent opts into `allow_skill_scripts`.
+
 Weather data comes from `MFA_WEATHER_PROVIDER`:
 - `open-meteo` (default): live data from [Open-Meteo](https://open-meteo.com/). It needs no API key; the hosts are `geocoding-api.open-meteo.com` and `api.open-meteo.com`. On Cloud Run and Agent Runtime the container calls these hosts. On Claude Managed Agents the tool runs in the `mfa` runner, so the CMA sandbox stays without network access.
 - `fixture`: deterministic offline data for Seattle, Paris, Tokyo, London and Portland. The tests always use it. For a fully reproducible eval run, set it where the tool runs: in your shell for `local` and `claude_managed`, and with `MFA_FORWARD_ENV=MFA_WEATHER_PROVIDER` at deploy time for the Gemini targets (`MFA_FORWARD_ENV` copies any listed env vars into the deployed container).
@@ -139,7 +143,57 @@ One eval suite can grade four runtimes only because they agree on what a turn re
 | More than `max_iterations` tool rounds | A round is one assistant message, however many tool calls it holds. The round past the cap is not executed. The turn ends with `AgentResult.error = "Error: iteration limit reached: max_iterations=N"`; the trajectory keeps the executed calls plus the refused ones (their `output` is that error). The thread stays usable for the next turn. |
 | Any other failure | `AgentResult.error` is set and the partial trajectory is kept. `/mfa/query` still answers 200; A2A marks the task `failed` with the same text. |
 | Final reply | The last non-empty assistant message of the turn, on `/mfa/query`, A2A and CMA alike. |
+| Skill files | `read`/`glob`/`grep` see only the skill folders, under one virtual root (`/workspace/skills/<skill>/...`), so a `read` call's `file_path` is the same on every target. A path outside them is refused with `Error: tool read failed: PermissionError: ...` everywhere; on CMA the runner denies the paused call before the server runs it. |
+| Skill scripts | Only with `allow_skill_scripts=True`, and only `python3|sh|bash|node <skill>/scripts/<file> args` without shell operators; anything else is `Error: tool bash failed: PermissionError: ...` on every target. |
 | Transient platform retries | Invisible: the Claude Managed Agents runner ignores `session.error` events the server is retrying (counted in `metadata.server_retries`) and only reports exhausted or terminal errors. |
+
+## Agent Skills, and the rest of the Claude Managed Agents feature set
+
+[Agent Skills](https://github.com/anthropics/skills) are folders of instructions and resources an agent loads on demand: `SKILL.md` (YAML frontmatter with `name` and `description`, then the instructions) plus optional `references/`, `scripts/` and `assets/`. The model sees only each skill's name, description and location until a task matches; then it reads `SKILL.md` and the files it references. Claude Managed Agents supports them natively. This template gives the LangGraph targets the same behaviour, so a skill-using turn produces the same `AgentResult` everywhere.
+
+**Adding skills to an agent**
+
+```python
+from mfa import AgentSpec, anthropic_skill, local_skills
+
+AGENT = AgentSpec(
+    ...,
+    skills=[*local_skills(Path(__file__).parent / "skills"), anthropic_skill("xlsx")],
+    allow_skill_scripts=False,   # True also exposes `bash`, limited to <skill>/scripts/ on every target
+    effort="high",               # optional model effort, applied on every target that has it
+)
+```
+
+`local_skills(folder)` loads every `<folder>/<name>/SKILL.md` one level deep (the same layout CMA scans in a repository's `.claude/skills/`); the frontmatter `name` must equal the folder name. Validation follows Anthropic's `quick_validate` rules. Tool names `bash`, `read`, `write`, `edit`, `glob`, `grep`, `web_fetch`, `web_search` are reserved for the built-in toolset.
+
+**What each target does**
+
+| | LangGraph targets (`local`, `agent_engine`, `cloud_run`) | `claude_managed` |
+|---|---|---|
+| Announcing skills | A `# Skills` block is appended to the system prompt: one line per skill with its description and location `/workspace/skills/<name>` (`MFA_SKILLS_ROOT` changes the root; it is virtual, nothing is copied) | The platform announces attached skills itself (its own wording and sandbox path) |
+| Reading skills | `read`, `glob`, `grep` tools with the toolset's input fields (`file_path`/`view_range`, `pattern`/`path`), confined to the skill folders | Skill folders are uploaded with the Skills API at deploy (a new version whenever content changes; the agent pins the version id, or `latest` with `MFA_CMA_SKILL_VERSION=latest`). The built-in `read`/`glob`/`grep` are enabled with the `always_ask` policy, so every call pauses the session and the runner approves or denies it with the same sandbox rules, then records the server's `agent.tool_result` text as the call's output |
+| Scripts | `bash` only with `allow_skill_scripts`; runs `<interpreter> <skill>/scripts/<file> args` as a fresh process with a minimal environment | `bash` enabled (also `always_ask`) only with `allow_skill_scripts`; the runner allows a command only if the same allowlist accepts it |
+| Iteration cap | A read round is a model message like any other and counts toward `max_iterations` | Same: the round past the cap is denied before it runs and the turn is interrupted |
+| Anthropic skills (`xlsx`, `docx`, `pptx`, `pdf`) | Announced as *available on Claude Managed Agents only*, unless `MFA_ANTHROPIC_SKILLS_DIR` points at a checkout of `anthropics/skills`, whose copy is then mounted as a local skill | Attached by id |
+| Packaging | Skill folders ship inside `agents/<name>/skills/` with the container and the Agent Runtime package (and in wheels via `package-data`) | Never packaged: uploaded, versioned, attached. `mfa export -t claude_managed` copies the folders beside `agent.md` for `ant` |
+
+**Known divergences (named, never faked in tests):** the server renders `read`/`glob`/`grep` output in its own format (line numbers, newest-first ordering, offload of outputs over 100,000 characters), so live evals assert `skills_used` and `tool_args_contain`, never the text of a built-in tool's output; the announced skill location may differ from the virtual root until a live session shows the real one (the runner records it in `metadata.skill_root`); CMA's `read` also renders images, PDFs and notebooks, ours is text-only; a tool the model names that the agent does not have is `Error: unknown tool ...` on LangGraph and `Permission to use ... has been denied.` on CMA; `bash` on CMA is a persistent shell in an isolated container, ours is a per-call process; `effort` is exact on Claude, a thinking-budget approximation on Gemini (`MFA_GEMINI_THINKING_BUDGET` overrides) and unverified on `anthropic_vertex`.
+
+**Feature parity matrix.** Where the LangGraph base agent stands against Claude Managed Agents' features:
+
+| CMA feature | Status | How |
+|---|---|---|
+| Custom tools | Mirrored | `@tool` functions run host-side on CMA and in-process elsewhere; one validation and error contract |
+| Skills (custom) | Mirrored | this section |
+| Skills (Anthropic-managed) | Partial | attached on CMA; local mirror only from a checkout of `anthropics/skills` with `allow_skill_scripts` and their Python dependencies |
+| Model effort / speed / inference geo | Mirrored / CMA-only | `AgentSpec.effort` or `MFA_EFFORT` everywhere; `MFA_CMA_SPEED`, `MFA_CMA_INFERENCE_GEO` pass through to CMA only |
+| Built-in toolset (`read`, `glob`, `grep`, `bash`) | Partial | mirrored for skills as above; `write`/`edit` not mirrored (skills are read-only); `web_search`/`web_fetch` off on CMA and not mirrored: express web access as a `@tool` |
+| Permission policies | Partial | `always_ask` + the runner gate is the parity mode; `MFA_CMA_ENABLE_TOOLSET=1` (everything on, policy `auto`) is a parity-breaking knob for experiments |
+| MCP servers | Not yet | `mcp_servers` + `mcp_toolset` on CMA, `langchain-mcp-adapters` on LangGraph; planned |
+| Memory stores (`/mnt/memory`) | CMA-only | a versioned cross-session store; `InMemorySaver` is conversation state, not memory |
+| Outcomes (rubric grader loop) | CMA-only | mfa's judge grades after the fact; the same rubrics could seed an outcome |
+| Multiagent (subagents, advisor, workflows) | CMA-only | a custom `graph_builder` is author topology; CMA receives prompt + tools + skills from it |
+| Session budgets, scheduled deployments, webhooks, vaults, repository mounts | CMA-only | control-plane features with no LangGraph equivalent in this template |
 
 ## Serving surface (`cloud_run` and `mfa build`)
 
@@ -176,6 +230,7 @@ cases:
 - **Passing:** a case passes when no check fails. A judge that is switched off (`--no-judge`) is a skip and doesn't fail a case. A judge that *could not run* (API error, refusal) is recorded as ungraded: it is not a pass, the report counts it under `judge_errors`, and `mfa eval` exits 1 when a gate is set unless you pass `--allow-ungraded`. A case whose runner or grader raises is a failed case with a `harness` check; it never discards the run.
 - **Trials:** `--trials N` runs every case N times. The table shows `passed/runs` per case and `mfa compare` says whether two targets' pass-rate intervals overlap. The 95% Wilson interval is computed over *cases* (trials refine each case's pass estimate but are not independent samples, so they never shrink the interval); more distinct cases are what narrows it.
 - **Environment:** every report records the non-secret `MFA_*` variables in effect (for example `MFA_WEATHER_PROVIDER`), so a cross-target difference can be traced to data, not only to the platform.
+- **Skills:** `skills_used: [name]` passes when the skill's `SKILL.md` was read during the case (any root, any target); `skills_not_used` is the opposite. Tool expectations may name the skill tools (`read`, `glob`, `grep`, `bash`) like any other tool.
 - **Reports:** `eval_results/<agent>/<target>-<timestamp>.{json,md}` record per-case checks, per-turn tool trajectories, latency, and CMA session IDs (which you can open in the Console session viewer).
 - **Gemini format:** `mfa export -t gemini_eval` converts any report, from any target, into the Gemini platform `EvaluationDataset` shape (`eval_cases[].agent_data.turns[].events[]`, with `function_call` / `function_response` parts). The rubric and mfa's own checks travel as extra fields for custom metrics.
 
@@ -188,9 +243,10 @@ cp -r agents/_template agents/my_agent
 1. In `tools.py`, write typed functions with Google-style `Args:` docstrings and decorate them with `@tool`. The JSON schema for every platform comes from these. List extra pip dependencies in `AgentSpec.requirements`; they ship to both Gemini targets.
 2. In `agent.py`, set the prompt, tools, per-target models and `eval_dataset`, and export `AGENT`. Fix the `agents._template...` import.
 3. In `evals/cases.yaml`, write the cases.
-4. Run `mfa eval my_agent -t local`, then `mfa deploy my_agent -t cloud_run,claude_managed`, then `mfa eval my_agent -t all`.
+4. Optional: add Agent Skills under `skills/<name>/SKILL.md` and attach them with `skills=local_skills(Path(__file__).parent / "skills")` (see *Agent Skills*). Set `effort` if the default depth is wrong for the job.
+5. Run `mfa eval my_agent -t local`, then `mfa deploy my_agent -t cloud_run,claude_managed`, then `mfa eval my_agent -t all`.
 
-Bringing an existing LangGraph graph: set `AgentSpec.graph_builder=lambda spec, model, *, checkpointer: <compiled graph>`. Its state needs a `messages` key. That graph is what `local`, `agent_engine` and `cloud_run` serve. To keep the iteration cap identical to the other targets, route after your model node with `mfa.runtime.graph.iteration_cap_route(spec, tools_node="<your tools node>")` instead of `tools_condition`; without it, only a generous `recursion_limit` safety net applies. A graph compiled with `interrupt_before` returns with the tool call pending: `run_turn` leaves it untouched and reports the waiting nodes in `metadata["pending_nodes"]`.
+Bringing an existing LangGraph graph: set `AgentSpec.graph_builder=lambda spec, model, *, checkpointer: <compiled graph>`. Its state needs a `messages` key. That graph is what `local`, `agent_engine` and `cloud_run` serve. Bind `mfa.runtime.graph.spec_tools(spec)` (the agent's tools plus the skill tools) and use `mfa.runtime.graph.system_prompt_for(spec)` so skills work in your graph too. To keep the iteration cap identical to the other targets, route after your model node with `mfa.runtime.graph.iteration_cap_route(spec, tools_node="<your tools node>")` instead of `tools_condition`; without it, only a generous `recursion_limit` safety net applies. A graph compiled with `interrupt_before` returns with the tool call pending: `run_turn` leaves it untouched and reports the waiting nodes in `metadata["pending_nodes"]`.
 
 ## Notes and limits
 
@@ -198,6 +254,7 @@ Bringing an existing LangGraph graph: set `AgentSpec.graph_builder=lambda spec, 
 - **Packaging:** both Gemini targets copy `src/mfa` and `agents/` and pin LangGraph, LangChain and SDK versions to your local install. Run deploys from a repo checkout (`pip install -e .`).
 - **CMA sandbox:** `limited` networking with no allowed hosts, because tools run host-side. The built-in toolset is off so the agent has exactly the spec's tools. `MFA_CMA_ENABLE_TOOLSET=1` adds it, with web tools still off. Any tool call the server pauses for approval during an eval is denied. Environment names are unique per workspace, so a deploy reuses `<agent>-env` if it exists.
 - **CMA turn timeout:** `MFA_CMA_TURN_TIMEOUT_S` (default 600). It is checked as events arrive, and the turn is interrupted when it is exceeded.
+- **Capability knobs:** `MFA_EFFORT` (overrides `AgentSpec.effort` on every target), `MFA_SKILLS_ROOT` (virtual skill root announced to the model, default `/workspace/skills`), `MFA_ANTHROPIC_SKILLS_DIR` (checkout of `anthropics/skills` to mirror Anthropic skills locally), `MFA_GEMINI_THINKING_BUDGET` (replaces the effort→budget mapping for Gemini), `MFA_CMA_SKILL_VERSION=latest` (attach `latest` instead of the uploaded version id), `MFA_CMA_SPEED`, `MFA_CMA_INFERENCE_GEO`.
 - **Cloud Run runner:** the identity token is refreshed before it expires (and once on a 401). Only failures that prove the request never reached the app are retried (connection refused, DNS, 429, 503), `MFA_CLOUD_RUN_RETRIES` times (default 3) with backoff; read timeouts and other 5xx are not, because a retry would run the same turn twice on the thread. The client timeout (960 s) is longer than the service's 900 s so the client never gives up first.
 - **Cost:** live evals call real models. A full run is 11 cases per target per trial plus one judge call per case.
 

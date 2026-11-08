@@ -7,7 +7,8 @@
 # with the right place, did it report temperatures), and the judge checks that
 # the reply matches the tool output it was given. For a fully reproducible run,
 # set MFA_WEATHER_PROVIDER=fixture (fixture cities: Seattle, Paris, Tokyo,
-# London, Portland).
+# London, Portland). The `skill` cases check that the weather-briefing skill is
+# read on demand (skills_used) and that plain forecasts leave it alone.
 
 cases:
   # --- asks where when the user doesn't say -------------------------------
@@ -26,8 +27,10 @@ cases:
     tags: [location]
     input: "Do I need an umbrella today?"
     expect:
-      no_tool_calls: true
+      # Reading the weather-briefing skill first is fine; looking up weather is not.
+      tools_not_called: [get_weather_today]
       output_contains_any: ["where", "which city", "what city", "location", "which place"]
+      output_not_contains: ["Wear:", "Rain:"]
     judge: >-
       The reply asks where the user is (or which place they mean) before answering,
       and does not guess whether it will rain.
@@ -55,6 +58,7 @@ cases:
       tools_called: [get_weather_today]
       tool_args_contain: {get_weather_today: {location: paris}}
       max_tool_calls: 1
+      skills_not_used: [weather-briefing]          # a plain forecast does not load the skill
       output_contains: ["Paris", "°F", "°C"]
     judge: >-
       The reply is for Paris, France and gives today's conditions, the current
@@ -103,6 +107,66 @@ cases:
     judge: >-
       The reply says no matching place was found and asks for a nearby city or a more
       specific name. It does not invent a forecast.
+
+  # --- the weather-briefing skill ------------------------------------------
+  # These cases prove the skill is loaded on demand on every target: the model
+  # reads skills/weather-briefing/SKILL.md, then references/clothing-guide.md,
+  # and answers in the skill's three-line shape with the guide's wording.
+  - id: briefing_uses_skill
+    tags: [skill, smoke]
+    input: "What should I wear in Paris today?"
+    expect:
+      tools_called: [get_weather_today, read]
+      tool_args_contain:
+        get_weather_today: {location: paris}
+        read: {file_path: "weather-briefing/SKILL.md"}
+      skills_used: [weather-briefing]
+      output_contains: ["Briefing for Paris", "Wear:", "Rain:"]
+      output_regex: "\\d+ ?°"
+    judge: >-
+      The reply follows the weather-briefing skill: a "Briefing for Paris..." line whose
+      numbers match the tool output, a "Wear:" line giving the clothing-guide advice for the
+      band that contains today's high (with the fixture data, 15°C is the mild band: a light
+      jacket or sweater over a long-sleeve shirt), and a "Rain:" line following the rain rule
+      for the chance of precipitation (10%: no umbrella needed).
+
+  - id: umbrella_uses_rain_rule
+    tags: [skill]
+    input: "Do I need an umbrella in Seattle today?"
+    expect:
+      tools_called: [get_weather_today, read]
+      tool_args_contain:
+        read: {file_path: "clothing-guide.md"}
+      skills_used: [weather-briefing]
+      output_contains: ["Rain:", "umbrella"]
+    judge: >-
+      The reply gives the full three-line briefing for Seattle and its "Rain:" line says rain
+      is likely and to bring an umbrella or rain jacket, consistent with the tool's high chance
+      of precipitation.
+
+  - id: day_plan_uses_skill
+    tags: [skill]
+    input: "Give me a quick briefing for my day in Tokyo."
+    expect:
+      tools_called: [get_weather_today, read]
+      skills_used: [weather-briefing]
+      output_contains: ["Briefing for Tokyo", "Wear:", "Rain:"]
+      output_not_contains: ["Wind:"]
+    judge: >-
+      The reply is the skill's briefing for Tokyo, Japan with numbers matching the tool output;
+      the "Wear:" line matches the clothing band for the high and there is no "Wind:" line
+      because the wind is light.
+
+  - id: briefing_needs_location_first
+    tags: [skill, location]
+    input: "What should I wear today?"
+    expect:
+      tools_not_called: [get_weather_today]
+      output_contains_any: ["where", "which city", "what city", "location", "which place"]
+      output_not_contains: ["Wear:", "Rain:"]
+    judge: >-
+      The reply asks which place the user means before giving any clothing advice. Reading the
+      skill's instructions first is acceptable; calling the weather tool or guessing is not.
 
   # --- scope and guardrails ------------------------------------------------
   - id: other_day

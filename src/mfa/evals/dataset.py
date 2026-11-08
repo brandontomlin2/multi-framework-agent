@@ -19,6 +19,8 @@ YAML format::
           output_contains_any: ["°F", "°C"]
           output_not_contains: ["I don't know"]
           output_regex: "\\\\d+ ?°"
+          skills_used: [weather-briefing]        # the skill's SKILL.md was read (any target)
+          skills_not_used: []
         judge: >-                                # optional LLM-as-judge rubric
           The reply gives today's conditions and temperatures that match the tool output.
 """
@@ -43,6 +45,8 @@ class Expectations(BaseModel):
     output_contains_any: list[str] = Field(default_factory=list)
     output_not_contains: list[str] = Field(default_factory=list)
     output_regex: str | None = None
+    skills_used: list[str] = Field(default_factory=list)  # a skill counts as used when its SKILL.md was read
+    skills_not_used: list[str] = Field(default_factory=list)
 
 
 class EvalCase(BaseModel):

@@ -167,8 +167,11 @@ def cmd_show(args) -> int:
         print(json.dumps({"agent_ref": agent_module_ref(spec, args.agent), "model": model,
                           "requirements": build_requirements(spec, model)}, indent=2))
     else:
-        print(json.dumps({"name": spec.name, "model": spec.model_for(args.target, args.model),
-                          "tools": [t.name for t in spec.tools]}, indent=2))
+        from mfa.skills import skills_prompt_block
+
+        print(json.dumps({"name": spec.name, "model": spec.model_for(args.target, args.model), "effort": spec.effort,
+                          "tools": [t.name for t in spec.tools], "skill_tools": [t.name for t in spec.runtime_tools()][len(spec.tools):],
+                          "skills": [sk.name for sk in spec.skills], "skills_prompt": skills_prompt_block(spec)}, indent=2))
     return 0
 
 

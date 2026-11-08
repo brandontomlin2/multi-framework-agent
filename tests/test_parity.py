@@ -13,16 +13,26 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
-from fastapi.testclient import TestClient
+from dataclasses import replace
+from pathlib import Path
 
-from mfa.runtime.result import AgentResult
-from mfa.spec import AGENT_ENGINE, CLAUDE_MANAGED, CLOUD_RUN, LOCAL, AgentSpec, format_tool_error, iteration_limit_error, tool
 from mfa.runtime.graph import recursion_limit_for
-from mfa.targets.agent_engine import AgentEngineRunner
-from mfa.targets.agent_engine_app import LangGraphAgentApp
+from mfa.runtime.result import AgentResult
+from mfa.skills import skills_prompt_block
+from mfa.spec import (
+    AGENT_ENGINE,
+    CLAUDE_MANAGED,
+    CLOUD_RUN,
+    LOCAL,
+    AgentSpec,
+    format_tool_error,
+    iteration_limit_error,
+    local_skills,
+    tool,
+)
 from mfa.targets.claude_managed import ClaudeManagedRunner
 from mfa.targets.local import LocalRunner
-from tests.fakes import FakeCMAClient, FakeRemoteAgentEngine, ScriptedChatModel
+from tests.fakes import FakeCMAClient, ScriptedChatModel
 
 
 @tool
@@ -110,58 +120,10 @@ def shape(r: AgentResult):
     return r.output, r.error, [(c.name, c.args, c.output) for c in r.tool_calls]
 
 
-class _HttpRunner:
-    """cloud_run as the evals see it: the FastAPI route, parsed back into an AgentResult."""
-
-    target = CLOUD_RUN
-
-    def __init__(self, client: TestClient):
-        self.client = client
-
-    def run(self, user_input, *, thread_id=None):
-        body = self.client.post("/mfa/query", json={"input": user_input, "thread_id": thread_id})
-        assert body.status_code == 200, body.text
-        return AgentResult.model_validate(body.json())
-
-
-@pytest.fixture
-def make_runner(monkeypatch):
-    """Build a runner for any target that replays ``script`` through the real adapter code."""
-    from mfa.serving import load_root_agent
-
-    made = []
-
-    def _make(target: str, script: list[dict]):
-        if target == LOCAL:
-            return LocalRunner(PARITY_SPEC, chat_model=ScriptedChatModel(script=list(script)))
-        if target == AGENT_ENGINE:
-            monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=list(script)))
-            app = LangGraphAgentApp(agent_ref=SELF_REF, model="x:y")
-            app.set_up()
-            return AgentEngineRunner(FakeRemoteAgentEngine(app), "projects/p/locations/l/reasoningEngines/1")
-        if target == CLOUD_RUN:
-            load_root_agent.cache_clear()
-            monkeypatch.setenv("MFA_AGENT", SELF_REF)
-            monkeypatch.setenv("MFA_MODEL", "x:y")
-            monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=list(script)))
-            from mfa.serving.fast_api_app import create_app
-
-            made.append(load_root_agent)
-            return _HttpRunner(TestClient(create_app()))
-        if target == CLAUDE_MANAGED:
-            record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "claude-test"}
-            return ClaudeManagedRunner(PARITY_SPEC, record, client=FakeCMAClient(script=list(script)))
-        raise ValueError(target)
-
-    yield _make
-    for cache in made:
-        cache.cache_clear()
-
-
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 def test_every_target_returns_the_same_result(scenario, make_runner):
     script, expected = SCENARIOS[scenario]
-    results = {t: make_runner(t, script).run("go") for t in TARGETS}
+    results = {t: make_runner(t, script, PARITY_SPEC, SELF_REF).run("go") for t in TARGETS}
     for target, r in results.items():
         assert shape(r) == expected, f"{target}: {shape(r)}"
         assert r.target == target
@@ -169,7 +131,7 @@ def test_every_target_returns_the_same_result(scenario, make_runner):
 
 @pytest.mark.parametrize("target", TARGETS)
 def test_second_turn_sees_the_first_and_reports_only_itself(target, make_runner):
-    runner = make_runner(target, [BOOK_CALL, {"text": "Booked."}, {"text": "Anything else?"}])
+    runner = make_runner(target, [BOOK_CALL, {"text": "Booked."}, {"text": "Anything else?"}], PARITY_SPEC, SELF_REF)
     first = runner.run("book two seats tomorrow", thread_id="thread-1")
     second = runner.run("thanks", thread_id="thread-1")
     assert shape(first) == SCENARIOS["happy_path_coerces_arguments"][1]
@@ -179,7 +141,7 @@ def test_second_turn_sees_the_first_and_reports_only_itself(target, make_runner)
 @pytest.mark.parametrize("target", TARGETS)
 def test_thread_recovers_after_a_failed_turn(target, make_runner):
     """A turn that hit the iteration limit must not poison the thread for the next turn."""
-    runner = make_runner(target, [BOOK_CALL] * 3 + [{"text": "Recovered."}])  # 3rd call is the one past the limit
+    runner = make_runner(target, [BOOK_CALL] * 3 + [{"text": "Recovered."}], PARITY_SPEC, SELF_REF)  # 3rd call is past the cap
     failed = runner.run("loop", thread_id="t")
     assert failed.error == iteration_limit_error(2)
     again = runner.run("try again", thread_id="t")
@@ -229,9 +191,9 @@ def test_tool_error_text_is_shared():
 @pytest.mark.parametrize("target", TARGETS)
 def test_max_iterations_rounds_are_allowed_and_one_more_is_not(target, make_runner):
     """n tool rounds plus an answer must succeed; the (n+1)th round is refused everywhere."""
-    exactly = make_runner(target, [BOOK_CALL] * PARITY_SPEC.max_iterations + [{"text": "Done."}]).run("go")
+    exactly = make_runner(target, [BOOK_CALL] * PARITY_SPEC.max_iterations + [{"text": "Done."}], PARITY_SPEC, SELF_REF).run("go")
     assert exactly.error is None and exactly.output == "Done." and len(exactly.tool_calls) == PARITY_SPEC.max_iterations
-    one_more = make_runner(target, [BOOK_CALL] * (PARITY_SPEC.max_iterations + 1) + [{"text": "Done."}]).run("go")
+    one_more = make_runner(target, [BOOK_CALL] * (PARITY_SPEC.max_iterations + 1) + [{"text": "Done."}], PARITY_SPEC, SELF_REF).run("go")
     assert one_more.error == iteration_limit_error(PARITY_SPEC.max_iterations)
     assert len(one_more.tool_calls) == PARITY_SPEC.max_iterations + 1
 
@@ -282,8 +244,6 @@ def _two_node_custom_graph(spec, model, *, checkpointer=None):
 
 
 def test_custom_graph_builder_gets_the_same_cap_and_recovers():
-    from dataclasses import replace
-
     spec = replace(PARITY_SPEC, graph_builder=_two_node_custom_graph)
     ok = LocalRunner(spec, chat_model=ScriptedChatModel(script=[BOOK_CALL] * 2 + [{"text": "Done."}])).run("go")
     assert ok.error is None and ok.output == "Done." and len(ok.tool_calls) == 2  # n rounds + answer pass
@@ -296,8 +256,6 @@ def test_custom_graph_builder_gets_the_same_cap_and_recovers():
 
 
 def test_interrupt_before_graph_is_left_pending_not_reported_as_the_cap():
-    from dataclasses import replace
-
     def hitl(spec, model, *, checkpointer=None):
         from langchain_core.messages import SystemMessage
         from langgraph.checkpoint.memory import InMemorySaver
@@ -319,3 +277,153 @@ def test_interrupt_before_graph_is_left_pending_not_reported_as_the_cap():
     assert r.error is None and r.metadata["pending_nodes"] == ["tools"]
     assert [(c.name, c.output) for c in r.tool_calls] == [("book", None)]  # waiting for approval, not refused
     assert runner.graph.get_state({"configurable": {"thread_id": "t"}}).next == ("tools",)
+
+
+# --- Agent Skills -----------------------------------------------------------
+# The same skill folder is read through LangGraph's sandbox tools and, on Claude
+# Managed Agents, through the built-in tools the runner approves with the same
+# sandbox rules. Locations are announced under one virtual root on every target.
+
+SKILLS_DIR = Path(__file__).parent / "skills"
+SKILL_SPEC = replace(PARITY_SPEC, name="skill_parity_agent", skills=local_skills(SKILLS_DIR))
+SCRIPT_SPEC = replace(SKILL_SPEC, name="script_parity_agent", allow_skill_scripts=True)
+SKILL_REF = "tests.test_parity:SKILL_SPEC"
+SCRIPT_REF = "tests.test_parity:SCRIPT_SPEC"
+ROOT = "/workspace/skills/parity-skill"
+SKILL_MD = (SKILLS_DIR / "parity-skill" / "SKILL.md").read_text()
+NOTES = (SKILLS_DIR / "parity-skill" / "references" / "notes.md").read_text()
+READ_SKILL = {"tool": "read", "args": {"file_path": f"{ROOT}/SKILL.md"}}
+READ_NOTES = {"tool": "read", "args": {"file_path": f"{ROOT}/references/notes.md"}}
+OUTSIDE = "Error: tool read failed: PermissionError: /etc/passwd is not inside a skill folder (/workspace/skills/<skill>/...)"
+
+SKILL_SCENARIOS = {
+    "skill_is_read_on_demand": (
+        [READ_SKILL, READ_NOTES, {"text": "Noted."}],
+        ("Noted.", None, [("read", READ_SKILL["args"], SKILL_MD), ("read", READ_NOTES["args"], NOTES)]),
+    ),
+    "view_range_is_coerced": (
+        [{"tool": "read", "args": {"file_path": f"{ROOT}/references/notes.md", "view_range": ["1", "2"]}}, {"text": "Two lines."}],
+        ("Two lines.", None, [("read", {"file_path": f"{ROOT}/references/notes.md", "view_range": ["1", "2"]}, "line one\nline two\n")]),
+    ),
+    "glob_and_grep_see_the_same_files": (
+        [{"tool": "glob", "args": {"pattern": "**/*.md"}}, {"tool": "grep", "args": {"pattern": "hello"}}, {"text": "Found."}],
+        ("Found.", None, [
+            ("glob", {"pattern": "**/*.md"}, f"{ROOT}/SKILL.md\n{ROOT}/references/notes.md"),
+            ("grep", {"pattern": "hello"}, f"{ROOT}/SKILL.md:8:Read `references/notes.md` for the notes. Run `scripts/hello.py` to say hello.\n"
+                                           f"{ROOT}/scripts/hello.py:3:print(\"hello from parity-skill\" + (\" \" + \" \".join(sys.argv[1:]) if len(sys.argv) > 1 else \"\"))"),
+        ]),
+    ),
+    "mixed_round_custom_and_skill_read": (
+        [{"calls": [BOOK_CALL, READ_SKILL]}, {"text": "Both."}],
+        ("Both.", None, [("book", BOOK_CALL["args"], BOOKED), ("read", READ_SKILL["args"], SKILL_MD)]),
+    ),
+    "missing_skill_file_is_an_error": (
+        [{"tool": "read", "args": {"file_path": f"{ROOT}/references/missing.md"}}, {"text": "No file."}],
+        ("No file.", None, [("read", {"file_path": f"{ROOT}/references/missing.md"},
+                             f"Error: tool read failed: FileNotFoundError: no such file in skill folder: {ROOT}/references/missing.md")]),
+    ),
+    "path_outside_skills_is_refused": (
+        [{"tool": "read", "args": {"file_path": "/etc/passwd"}}, {"text": "Refused."}],
+        ("Refused.", None, [("read", {"file_path": "/etc/passwd"}, OUTSIDE)]),
+    ),
+    "skill_reads_count_toward_the_cap": (
+        [READ_SKILL] * 3 + [{"text": "never"}],
+        ("", iteration_limit_error(2), [("read", READ_SKILL["args"], SKILL_MD)] * 2 + [("read", READ_SKILL["args"], iteration_limit_error(2))]),
+    ),
+}
+
+
+@pytest.mark.parametrize("scenario", list(SKILL_SCENARIOS))
+def test_skill_scenarios_match_on_every_target(scenario, make_runner):
+    script, expected = SKILL_SCENARIOS[scenario]
+    for target in TARGETS:
+        r = make_runner(target, script, SKILL_SPEC, SKILL_REF).run("go")
+        assert shape(r) == expected, f"{target}: {shape(r)}"
+        if expected[2] and expected[2][0][0] == "read" and "SKILL.md" in expected[2][0][1]["file_path"]:
+            assert r.metadata.get("skills_used") == ["parity-skill"], target
+
+
+def test_refused_skill_read_never_runs_on_cma(make_runner):
+    runner = make_runner(CLAUDE_MANAGED, [{"tool": "read", "args": {"file_path": "/etc/passwd"}}, {"text": "x"}], SKILL_SPEC, SKILL_REF)
+    runner.run("go")
+    confirmations = [e for e in runner.fake.sent if e["type"] == "user.tool_confirmation"]
+    assert confirmations == [{"type": "user.tool_confirmation", "tool_use_id": confirmations[0]["tool_use_id"],
+                              "result": "deny", "deny_message": OUTSIDE}]
+
+
+def test_cap_on_cma_denies_the_paused_read_and_interrupts_in_one_batch(make_runner):
+    runner = make_runner(CLAUDE_MANAGED, [READ_SKILL] * 3 + [{"text": "never"}], SKILL_SPEC, SKILL_REF)
+    assert runner.run("go").error == iteration_limit_error(2)
+    last = runner.fake.batches[-1]
+    assert [e["type"] for e in last] == ["user.tool_confirmation", "user.interrupt"]
+    assert last[0]["result"] == "deny" and last[0]["deny_message"] == iteration_limit_error(2)
+
+
+def test_mixed_round_sends_the_confirmation_at_the_round_boundary(make_runner):
+    runner = make_runner(CLAUDE_MANAGED, [{"calls": [BOOK_CALL, READ_SKILL]}, {"text": "Both."}], SKILL_SPEC, SKILL_REF)
+    assert runner.run("go").output == "Both."
+    kinds = [[e["type"] for e in b] for b in runner.fake.batches]
+    assert kinds == [["user.message"], ["user.custom_tool_result"], ["user.tool_confirmation"]]
+
+
+def test_bash_runs_only_a_skills_own_scripts(make_runner):
+    ok = {"tool": "bash", "args": {"command": f"python3 {ROOT}/scripts/hello.py there"}}
+    bad = {"tool": "bash", "args": {"command": "cat /etc/passwd | head"}}
+    expected = ("Ran.", None, [
+        ("bash", ok["args"], "hello from parity-skill there\n"),
+        ("bash", bad["args"], "Error: tool bash failed: PermissionError: only a skill's own scripts/ may be run, "
+                              "without shell operators: cat /etc/passwd | head"),
+    ])
+    for target in TARGETS:
+        r = make_runner(target, [ok, bad, {"text": "Ran."}], SCRIPT_SPEC, SCRIPT_REF).run("go")
+        assert shape(r) == expected, f"{target}: {shape(r)}"
+
+
+def test_bash_without_opt_in_is_refused_on_every_target(make_runner):
+    """Named divergence: LangGraph does not bind bash at all; the server refuses the disabled tool."""
+    script = [{"tool": "bash", "args": {"command": f"python3 {ROOT}/scripts/hello.py"}}, {"text": "x"}]
+    lg = make_runner(LOCAL, script, SKILL_SPEC, SKILL_REF).run("go")
+    assert lg.tool_calls[0].output == "Error: unknown tool bash; available tools: book, boom, read, glob, grep"
+    cma = make_runner(CLAUDE_MANAGED, script, SKILL_SPEC, SKILL_REF).run("go")
+    assert cma.tool_calls[0].output == "Permission to use bash has been denied."
+    assert cma.metadata["server_denials"] == 1
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_skill_spec_threads_recover_after_a_capped_turn(target, make_runner):
+    runner = make_runner(target, [READ_SKILL] * 3 + [{"text": "Recovered."}], SKILL_SPEC, SKILL_REF)
+    assert runner.run("loop", thread_id="t").error == iteration_limit_error(2)
+    assert shape(runner.run("again", thread_id="t")) == ("Recovered.", None, [])
+
+
+def test_langgraph_announces_skills_and_binds_the_toolset_schemas():
+    model = ScriptedChatModel(script=[{"text": "hi"}])
+    LocalRunner(SKILL_SPEC, chat_model=model).run("hello")
+    system = model.seen_messages[0][0].content
+    assert system == SKILL_SPEC.system_prompt + "\n\n" + skills_prompt_block(SKILL_SPEC)
+    assert f"- parity-skill: {SKILL_SPEC.skills[0].description} (location: {ROOT})" in system
+    bound = {t.name: t.args_schema for t in model.bound_tools}
+    assert list(bound) == ["book", "boom", "read", "glob", "grep"]
+    assert set(bound["read"]["properties"]) == {"file_path", "view_range"}
+    assert set(bound["glob"]["properties"]) == {"pattern", "path"} == set(bound["grep"]["properties"])
+    scripted = ScriptedChatModel(script=[{"text": "hi"}])
+    LocalRunner(SCRIPT_SPEC, chat_model=scripted).run("hello")
+    assert set({t.name: t for t in scripted.bound_tools}["bash"].args_schema["properties"]) == {"command", "restart", "timeout_ms"}
+
+
+def test_cma_translation_attaches_skills_and_gates_the_file_tools():
+    from mfa.targets.claude_managed import ClaudeManagedTarget
+
+    client = FakeCMAClient(spec=SKILL_SPEC)
+    rec = ClaudeManagedTarget().deploy(SKILL_SPEC, client=client)
+    params = client.created_agents[0]
+    assert params["skills"] == [{"type": "custom", "skill_id": "skill_fake_parity-skill", "version": "skillver_1"}]
+    toolset = params["tools"][0]
+    assert toolset["type"] == "agent_toolset_20260401"
+    assert toolset["default_config"] == {"enabled": False, "permission_policy": {"type": "always_ask"}}
+    assert [(c["name"], c.get("enabled")) for c in toolset["configs"]] == [
+        ("read", True), ("glob", True), ("grep", True), ("web_fetch", False), ("web_search", False)]
+    assert [t["name"] for t in params["tools"][1:]] == ["book", "boom"]
+    assert params["system"] == SKILL_SPEC.system_prompt  # the server announces skills itself
+    assert client.uploaded == {"parity-skill": ["parity-skill/SKILL.md", "parity-skill/references/notes.md", "parity-skill/scripts/hello.py"]}
+    assert rec["skills"]["parity-skill"]["version"] == "skillver_1" and rec["toolset"] == ["read", "glob", "grep"]

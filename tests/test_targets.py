@@ -2,7 +2,6 @@ import pickle
 
 import pytest
 
-from mfa import deployments
 from mfa.registry import load_agent
 from mfa.spec import AGENT_ENGINE, CLAUDE_MANAGED
 from mfa.targets.agent_engine import AgentEngineRunner, agent_module_ref, build_requirements
@@ -17,11 +16,6 @@ SCRIPT = [
     {"tool": "get_weather_today", "args": {"location": "Paris"}},
     {"text": "In Paris today: partly cloudy, 54°F (12°C), high 59°F (15°C), low 46°F (8°C), 10% chance of rain."},
 ]
-
-
-@pytest.fixture(autouse=True)
-def _tmp_deployments(tmp_path, monkeypatch):
-    monkeypatch.setattr(deployments, "DEFAULT_DIR", tmp_path / ".deployments")
 
 
 def test_local_runner_runs_tool_loop():
@@ -44,7 +38,7 @@ def test_local_runner_keeps_thread_state_and_reports_only_current_turn():
 def test_agent_engine_app_pickles_and_queries(monkeypatch):
     app = LangGraphAgentApp(agent_ref=agent_module_ref(SPEC, "weather_agent"), model="anthropic:claude-opus-5-5")
     app = pickle.loads(pickle.dumps(app))  # what Agent Engine does with the object
-    monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=list(SCRIPT)))
+    monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m, **kw: ScriptedChatModel(script=list(SCRIPT)))
     app.set_up()
     runner = AgentEngineRunner(FakeRemoteAgentEngine(app), "projects/p/locations/l/reasoningEngines/1")
     r = runner.run("weather in Paris today?")
@@ -66,9 +60,31 @@ def test_claude_managed_translation_mirrors_spec():
     params = build_agent_params(SPEC, "claude-opus-5-5")
     assert params["system"] == SPEC.system_prompt
     assert params["model"] == {"id": "claude-opus-5-5"}
-    assert [t["name"] for t in params["tools"]] == [t.name for t in SPEC.tools]
-    assert all(t["type"] == "custom" for t in params["tools"])
-    assert params["tools"][0]["input_schema"] == SPEC.tools[0].input_schema
+    custom = [t for t in params["tools"] if t["type"] == "custom"]
+    assert [t["name"] for t in custom] == [t.name for t in SPEC.tools]
+    assert custom[0]["input_schema"] == SPEC.tools[0].input_schema
+    # The weather agent has a skill, so the file tools are on (always_ask) and the skill is attached.
+    assert params["tools"][0]["type"] == "agent_toolset_20260401"
+    assert params["skills"] == [{"type": "custom", "skill_id": "<uploaded at deploy: weather-briefing>"}]
+
+
+def test_effort_reaches_each_provider(monkeypatch):
+    from dataclasses import replace
+
+    from mfa.runtime.models import GEMINI_THINKING_BUDGET, effective_effort, make_chat_model
+    from mfa.targets.claude_managed import model_params
+
+    monkeypatch.setenv("MFA_ANTHROPIC_API_KEY", "sk-test")
+    assert make_chat_model("anthropic:claude-opus-5-5", effort="high").reasoning_effort == "high"
+    assert make_chat_model("anthropic:claude-opus-5-5").reasoning_effort is None
+    spec = replace(SPEC, effort="xhigh")
+    assert model_params(spec, "claude-opus-5-5") == {"id": "claude-opus-5-5", "effort": "xhigh"}
+    assert model_params(SPEC, "claude-opus-5-5") == {"id": "claude-opus-5-5"}
+    assert GEMINI_THINKING_BUDGET["xhigh"] > GEMINI_THINKING_BUDGET["low"]
+    monkeypatch.setenv("MFA_EFFORT", "low")
+    assert effective_effort("xhigh") == "low"  # the env knob wins on every target
+    with pytest.raises(ValueError):
+        replace(SPEC, effort="turbo")
 
 
 def test_claude_managed_deploy_creates_then_updates():
@@ -90,3 +106,74 @@ def test_claude_managed_runner_executes_custom_tools_host_side():
     results = [e for e in client.sent if e["type"] == "user.custom_tool_result"]
     assert len(results) == 1 and "partly cloudy" in results[0]["content"][0]["text"]
     assert "partly cloudy" in r.output
+
+
+# --- the weather-briefing skill, end to end on every target -----------------
+
+from pathlib import Path  # noqa: E402
+
+from mfa.evals import load_cases, run_eval  # noqa: E402
+from mfa.spec import CLOUD_RUN, LOCAL  # noqa: E402
+
+SKILL_DIR = Path(__file__).resolve().parents[1] / "agents" / "weather_agent" / "skills" / "weather-briefing"
+BRIEFING_SCRIPT = [
+    {"tool": "get_weather_today", "args": {"location": "Paris"}},
+    {"tool": "read", "args": {"file_path": "/workspace/skills/weather-briefing/SKILL.md"}},
+    {"tool": "read", "args": {"file_path": "/workspace/skills/weather-briefing/references/clothing-guide.md"}},
+    {"text": "Briefing for Paris, Île-de-France, France: partly cloudy, 54°F (12°C), high 59°F (15°C), low 46°F (8°C), "
+             "10% chance of rain.\nWear: a light jacket or sweater over a long-sleeve shirt.\nRain: no umbrella needed."},
+]
+ALL_TARGETS = (LOCAL, AGENT_ENGINE, CLOUD_RUN, CLAUDE_MANAGED)
+
+
+@pytest.mark.parametrize("target", ALL_TARGETS)
+def test_briefing_case_passes_on_every_target(target, make_runner):
+    runner = make_runner(target, BRIEFING_SCRIPT, SPEC, "weather_agent")
+    report = run_eval(agent=SPEC.name, runner=runner, cases=load_cases(SPEC.eval_dataset, ids=["briefing_uses_skill"]), judge=None)
+    case = report.cases[0]
+    assert case.passed, [c for c in case.checks if c.passed is False]
+    assert {c.name: c.passed for c in case.checks}["skill:weather-briefing"] is True
+    reads = [c for c in case.result.tool_calls if c.name == "read"]
+    assert reads[0].output == (SKILL_DIR / "SKILL.md").read_text()
+    assert reads[1].output == (SKILL_DIR / "references" / "clothing-guide.md").read_text()
+    assert case.result.metadata["skills_used"] == ["weather-briefing"]
+
+
+def test_plain_weather_case_fails_if_the_skill_is_read(make_runner):
+    curious = [
+        {"tool": "read", "args": {"file_path": "/workspace/skills/weather-briefing/SKILL.md"}},
+        {"tool": "get_weather_today", "args": {"location": "Paris"}},
+        {"text": "In Paris today: partly cloudy, 54°F (12°C), high 59°F (15°C), low 46°F (8°C), 10% chance of rain."},
+    ]
+    runner = make_runner(LOCAL, curious, SPEC, "weather_agent")
+    report = run_eval(agent=SPEC.name, runner=runner, cases=load_cases(SPEC.eval_dataset, ids=["weather_with_city"]), judge=None)
+    failed = {c.name for c in report.cases[0].checks if c.passed is False}
+    assert "skill_not:weather-briefing" in failed and "max_tool_calls" in failed
+
+
+def test_cma_deploy_uploads_a_skill_once_and_versions_it_on_change(tmp_path):
+    import shutil
+    from dataclasses import replace
+
+    from mfa.spec import local_skills
+
+    skills_dir = tmp_path / "skills"
+    shutil.copytree(SKILL_DIR, skills_dir / "weather-briefing")
+    spec = replace(SPEC, skills=local_skills(skills_dir))
+    client = FakeCMAClient(spec=spec)
+    target = ClaudeManagedTarget()
+
+    rec1 = target.deploy(spec, client=client)
+    assert client.uploaded["weather-briefing"] == [
+        "weather-briefing/SKILL.md", "weather-briefing/references/clothing-guide.md", "weather-briefing/scripts/briefing_lines.py"]
+    assert rec1["skills"]["weather-briefing"]["version"] == "skillver_1"
+    assert client.created_agents[0]["skills"] == [{"type": "custom", "skill_id": "skill_fake_weather-briefing", "version": "skillver_1"}]
+
+    rec2 = target.deploy(spec, client=client)  # unchanged content: nothing re-uploaded
+    assert len(client.uploaded["weather-briefing"]) == 3 and rec2["skills"]["weather-briefing"]["version"] == "skillver_1"
+
+    (skills_dir / "weather-briefing" / "SKILL.md").write_text((skills_dir / "weather-briefing" / "SKILL.md").read_text() + "\nMore.\n")
+    spec2 = replace(SPEC, skills=local_skills(skills_dir))
+    rec3 = target.deploy(spec2, client=client)
+    assert len(client.uploaded["weather-briefing"]) == 6 and rec3["skills"]["weather-briefing"]["version"] == "skillver_2"
+    assert client.updated_agents[-1][1]["skills"][0]["version"] == "skillver_2"

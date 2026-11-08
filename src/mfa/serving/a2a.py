@@ -141,6 +141,10 @@ def agent_card(spec: AgentSpec) -> AgentCard:
         skills=[
             AgentSkill(id=t.name, name=t.name, description=t.description, tags=[spec.name])
             for t in spec.tools
+        ] + [
+            # Agent Skills appear beside the tools so A2A clients see what the agent knows how to do.
+            AgentSkill(id=f"skill:{sk.name}", name=sk.name, description=sk.description, tags=[spec.name, "skill"])
+            for sk in spec.skills
         ] or [AgentSkill(id="chat", name="chat", description=spec.description, tags=[spec.name])],
     )
 

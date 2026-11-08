@@ -38,8 +38,8 @@ def create_app() -> FastAPI:
     target = os.environ.get("MFA_TARGET", CLOUD_RUN)
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok", "agent": spec.name, "model": model}
+    def health() -> dict:
+        return {"status": "ok", "agent": spec.name, "model": model, "skills": [sk.name for sk in spec.skills]}
 
     @app.post("/mfa/query")
     async def query(req: QueryRequest) -> dict:

@@ -18,6 +18,10 @@ first; if the user has not said where, ask before doing anything else.
    - the clothing band that contains today's **high** in °C,
    - the rain rule for today's **chance of precipitation**,
    - the wind note if the current wind is 20 km/h or more.
+
+   If a `bash` tool is available to you, you may instead run
+   `python3 <this skill's folder>/scripts/briefing_lines.py --high-c H --precip P --wind-kmh W`;
+   its output is the exact Wear/Rain (and Wind) lines.
 2. Reply in exactly this shape, as plain text with these three labelled lines
    and nothing else before them:
 

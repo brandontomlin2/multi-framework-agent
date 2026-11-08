@@ -25,6 +25,8 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from pydantic import Field
 
+from mfa.spec import BUILTIN_TOOL_NAMES
+
 
 class ScriptedChatModel(BaseChatModel):
     """Returns pre-scripted AIMessages in order and records what it was given.
@@ -76,21 +78,34 @@ class FakeCMAClient:
     """Mimics client.beta.{environments,agents,sessions} enough for deploy + runner tests.
 
     For each session turn it replays the script above the way the service
-    streams it: a tool step becomes one ``agent.custom_tool_use`` event per call
-    followed by a single ``session.status_idle(requires_action)``; the model only
-    continues (next script step) once every call has a ``user.custom_tool_result``;
+    streams it: a custom tool step becomes one ``agent.custom_tool_use`` event per
+    call followed by a single ``session.status_idle(requires_action)``; the model
+    only continues (next script step) once every call has a ``user.custom_tool_result``;
     text steps become ``agent.message``; error steps become ``session.error``.
     ``user.interrupt`` stops a running model step; while tool calls are still
     unresolved it does nothing, as on the service.
+
+    Built-in tools (``read``, ``glob``, ``grep``, ``bash``, ...) follow the
+    ``always_ask`` protocol the mfa deploy configures: ``agent.tool_use`` with
+    ``evaluated_permission="ask"``, then ``requires_action``; a
+    ``user.tool_confirmation`` allow runs the call through the same skill tools
+    the LangGraph graph binds (pass ``spec``) and emits ``agent.tool_result``; a
+    deny emits an error result carrying the deny message. A tool not in
+    ``builtin_enabled`` is refused by the server (``evaluated_permission="deny"``).
     """
 
-    def __init__(self, script: list[dict[str, Any]] | None = None):
+    def __init__(self, script: list[dict[str, Any]] | None = None, *, spec: Any | None = None,
+                 builtin_enabled: set[str] | None = None):
         self.script = list(script or [])
         self.sent: list[dict[str, Any]] = []
+        self.batches: list[list[dict[str, Any]]] = []  # each events=[...] request as sent
         self.existing_envs: list[Any] = []
         self.env_creates = 0
         self.created_agents: list[dict[str, Any]] = []
         self.updated_agents: list[tuple[str, dict[str, Any]]] = []
+        self.sessions_created: list[dict[str, Any]] = []
+        self.uploaded: dict[str, list[str]] = {}  # skill slug -> uploaded file names
+        self.skill_versions: dict[str, int] = {}
         self.beta = SimpleNamespace(
             environments=SimpleNamespace(create=self._env_create, list=lambda **kw: list(self.existing_envs)),
             agents=SimpleNamespace(create=self._agent_create, update=self._agent_update, retrieve=self._agent_retrieve),
@@ -99,9 +114,21 @@ class FakeCMAClient:
                 events=SimpleNamespace(stream=self._stream, send=self._send),
             ),
         )
+        self.skills = SimpleNamespace(
+            create=self._skill_create,
+            list=lambda **kw: [],
+            versions=SimpleNamespace(create=self._skill_version_create),
+        )
         self._pending: list[Any] = []
         self._unresolved: set[str] = set()
+        self._builtin_calls: dict[str, tuple[str, dict[str, Any]]] = {}
         self._version = 0
+        self._builtin_tools: dict[str, Any] = {}
+        if spec is not None:
+            from mfa.skills import skill_tools
+
+            self._builtin_tools = {t.name: t for t in skill_tools(spec)}
+        self.builtin_enabled = set(builtin_enabled) if builtin_enabled is not None else set(self._builtin_tools)
 
     # control plane
     def _env_create(self, **kw):
@@ -122,11 +149,28 @@ class FakeCMAClient:
         return SimpleNamespace(id=agent_id, version=self._version)
 
     def _session_create(self, **kw):
+        self.sessions_created.append(kw)
         return SimpleNamespace(id=f"sesn_{uuid.uuid4().hex[:6]}")
+
+    # skills API
+    def _skill_create(self, *, files, display_name=None, **kw):
+        names = [f[0] if isinstance(f, tuple) else str(f) for f in files]
+        slug = names[0].split("/")[0]
+        self.uploaded.setdefault(slug, []).extend(names)
+        self.skill_versions[slug] = 1
+        return SimpleNamespace(id=f"skill_fake_{slug}", latest_version_id="skillver_1", display_name=display_name or slug)
+
+    def _skill_version_create(self, skill_id, *, files, **kw):
+        names = [f[0] if isinstance(f, tuple) else str(f) for f in files]
+        slug = names[0].split("/")[0]
+        self.uploaded.setdefault(slug, []).extend(names)
+        self.skill_versions[slug] = self.skill_versions.get(slug, 1) + 1
+        return SimpleNamespace(id=f"skillver_{self.skill_versions[slug]}", skill_id=skill_id, name=slug)
 
     # data plane
     def _send(self, *, session_id, events):
         self.sent.extend(events)
+        self.batches.append(list(events))
         interrupt = any(e["type"] == "user.interrupt" for e in events)
         for e in events:
             if e["type"] == "user.message":
@@ -135,10 +179,25 @@ class FakeCMAClient:
                 self._unresolved.discard(e["custom_tool_use_id"])
                 if not self._unresolved and not interrupt:
                     self._advance()  # every call answered: the model runs again
+            elif e["type"] == "user.tool_confirmation":
+                self._confirm(e)
+                if not self._unresolved and not interrupt:
+                    self._advance()
         if interrupt and not self._unresolved:
             # Stops the running step before it produced anything; the turn ends idle.
             self._pending.clear()
             self._pending.append(_idle("end_turn"))
+
+    def _confirm(self, e):
+        tool_use_id = e["tool_use_id"]
+        name, args = self._builtin_calls.pop(tool_use_id, (None, {}))
+        self._unresolved.discard(tool_use_id)
+        if e["result"] == "deny":
+            text, is_error = e.get("deny_message") or f"Permission to use {name} has been denied.", True
+        else:
+            # The server runs the built-in tool in the sandbox; here the same ToolSpec the graph binds runs it.
+            text, is_error = self._builtin_tools[name].run(args)
+        self._pending.append(_tool_result(tool_use_id, text, is_error))
 
     def _advance(self):
         if not self.script:
@@ -171,11 +230,28 @@ class FakeCMAClient:
         if calls:
             for c in calls:
                 ev_id = f"sevt_{uuid.uuid4().hex[:6]}"
-                self._unresolved.add(ev_id)
-                self._pending.append(
-                    SimpleNamespace(type="agent.custom_tool_use", id=ev_id, name=c["tool"], input=c["args"])
-                )
-            self._pending.append(_idle("requires_action"))
+                if c["tool"] in BUILTIN_TOOL_NAMES:
+                    if c["tool"] not in self.builtin_enabled:
+                        # Not enabled on the agent: the server refuses before any policy applies.
+                        self._pending.append(SimpleNamespace(
+                            type="agent.tool_use", id=ev_id, name=c["tool"], input=c["args"],
+                            evaluated_permission="deny", evaluation=None))
+                        self._pending.append(_tool_result(ev_id, f"Permission to use {c['tool']} has been denied.", True))
+                        continue
+                    self._unresolved.add(ev_id)
+                    self._builtin_calls[ev_id] = (c["tool"], dict(c["args"]))
+                    self._pending.append(SimpleNamespace(
+                        type="agent.tool_use", id=ev_id, name=c["tool"], input=c["args"],
+                        evaluated_permission="ask", evaluation=SimpleNamespace(type="always_ask")))
+                else:
+                    self._unresolved.add(ev_id)
+                    self._pending.append(
+                        SimpleNamespace(type="agent.custom_tool_use", id=ev_id, name=c["tool"], input=c["args"])
+                    )
+            if self._unresolved:
+                self._pending.append(_idle("requires_action", sorted(self._unresolved)))
+            else:
+                self._advance()  # every call was refused by the server: the model goes on
         elif step.get("end_turn", True):
             self._pending.append(_idle("end_turn"))
 
@@ -196,8 +272,16 @@ class FakeCMAClient:
         return _S()
 
 
-def _idle(reason: str):
-    return SimpleNamespace(type="session.status_idle", stop_reason=SimpleNamespace(type=reason))
+def _idle(reason: str, event_ids: list[str] | None = None):
+    stop = SimpleNamespace(type=reason)
+    if event_ids is not None:
+        stop.event_ids = event_ids
+    return SimpleNamespace(type="session.status_idle", stop_reason=stop)
+
+
+def _tool_result(tool_use_id: str, text: str, is_error: bool):
+    return SimpleNamespace(type="agent.tool_result", id=f"sevt_{uuid.uuid4().hex[:6]}", tool_use_id=tool_use_id,
+                           content=[SimpleNamespace(type="text", text=text)], is_error=is_error)
 
 
 class FakeRemoteAgentEngine:

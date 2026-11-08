@@ -2,6 +2,8 @@ import json
 from datetime import date
 from unittest import mock
 
+import pytest
+
 from mfa.registry import load_agent
 from mfa.spec import AGENT_ENGINE, CLAUDE_MANAGED, CLOUD_RUN, LOCAL
 
@@ -80,3 +82,49 @@ def test_mfa_specific_key_takes_precedence(monkeypatch):
     assert make_chat_model("anthropic:claude-opus-5-5").anthropic_api_key.get_secret_value() == "sk-mfa"
     monkeypatch.delenv("MFA_ANTHROPIC_API_KEY")
     assert anthropic_client().api_key == "sk-generic"
+
+
+def test_skill_folders_load_and_validate(tmp_path):
+    from mfa.spec import AgentSpec, anthropic_skill, local_skills, skill, tool
+
+    sk = skill("agents/weather_agent/skills/weather-briefing")
+    assert sk.name == "weather-briefing" and sk.source == "custom" and sk.license == "Apache-2.0"
+    assert sk.metadata == {"author": "multi-framework-agent", "version": "1.0"} and sk.has_scripts
+    assert [rel for rel, _ in sk.files()] == ["SKILL.md", "references/clothing-guide.md", "scripts/briefing_lines.py"]
+    assert len(sk.content_hash()) == 64
+    assert [s.name for s in local_skills("agents/weather_agent/skills")] == ["weather-briefing"]
+    assert local_skills(tmp_path / "nope") == []
+
+    bad = tmp_path / "my-skill"
+    bad.mkdir()
+    (bad / "SKILL.md").write_text("---\nname: other-name\ndescription: x\n---\nbody")
+    with pytest.raises(ValueError, match="must match its folder name"):
+        skill(bad)
+    (bad / "SKILL.md").write_text("---\nname: My_Skill\ndescription: x\n---\nbody")
+    with pytest.raises(ValueError, match="lowercase"):
+        skill(bad)
+    (bad / "SKILL.md").write_text("---\nname: my-skill\ndescription: uses <tags>\n---\nbody")
+    with pytest.raises(ValueError, match="'<' or '>'"):
+        skill(bad)
+    (bad / "SKILL.md").write_text("---\nname: my-skill\ndescription: fine\nextra: nope\n---\nbody")
+    with pytest.raises(ValueError, match="unexpected keys"):
+        skill(bad)
+    with pytest.raises(FileNotFoundError):
+        skill(tmp_path)
+
+    a = anthropic_skill("xlsx", version="2")
+    assert (a.source, a.name, a.version, a.is_local, a.files()) == ("anthropic", "xlsx", "2", False, [])
+
+    @tool
+    def read(file_path: str) -> str:
+        """Clashes with the built-in toolset.
+
+        Args:
+            file_path: A path.
+        """
+        return file_path
+
+    with pytest.raises(ValueError, match="reserved for the built-in toolset"):
+        AgentSpec(name="x", description="d", system_prompt="p", tools=[read])
+    with pytest.raises(ValueError, match="unique"):
+        AgentSpec(name="x", description="d", system_prompt="p", tools=[], skills=[sk, sk])
