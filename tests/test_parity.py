@@ -83,6 +83,18 @@ SCENARIOS = {
         [{"tool": "teleport", "args": {"to": "Mars"}}, {"text": "No such tool."}],
         ("No such tool.", None, [("teleport", {"to": "Mars"}, "Error: unknown tool teleport; available tools: book, boom")]),
     ),
+    "parallel_calls_count_as_one_round": (
+        [{"calls": [BOOK_CALL, {"tool": "boom", "args": {"reason": "p"}}]}, {"text": "Both done."}],
+        ("Both done.", None, [
+            ("book", BOOK_CALL["args"], BOOKED),
+            ("boom", {"reason": "p"}, "Error: tool boom failed: RuntimeError: kaboom: p"),
+        ]),
+    ),
+    "parallel_round_past_the_cap_is_refused_whole": (
+        [{"calls": [BOOK_CALL, BOOK_CALL]}] * 3 + [{"text": "never reached"}],
+        ("", iteration_limit_error(2), [("book", BOOK_CALL["args"], BOOKED)] * 4
+         + [("book", BOOK_CALL["args"], iteration_limit_error(2))] * 2),
+    ),
     "loop_hits_max_iterations": (
         [BOOK_CALL] * 5 + [{"text": "never reached"}],
         ("", iteration_limit_error(2), [
@@ -224,6 +236,86 @@ def test_max_iterations_rounds_are_allowed_and_one_more_is_not(target, make_runn
     assert len(one_more.tool_calls) == PARITY_SPEC.max_iterations + 1
 
 
-def test_recursion_limit_matches_langgraph_step_counting():
-    # 2n+1 supersteps are needed for n rounds and LangGraph stops at the limit itself.
-    assert recursion_limit_for(2) == 6 and recursion_limit_for(4) == 10
+def test_recursion_limit_is_only_a_generous_safety_net():
+    # n rounds need 2n+1 supersteps in the template; custom rounds may take more, so the
+    # limit is well above that and never the thing that enforces max_iterations.
+    assert recursion_limit_for(2) >= 2 * 2 + 2 and recursion_limit_for(30) >= 2 * 30 + 2
+
+
+def test_langgraph_tool_messages_carry_the_error_flag_cma_sends():
+    """The model must see the same is_error signal on every target, not only the same text."""
+    runner = LocalRunner(PARITY_SPEC, chat_model=ScriptedChatModel(script=[
+        {"calls": [BOOK_CALL, {"tool": "boom", "args": {"reason": "x"}}, {"tool": "nope", "args": {}}]}, {"text": "ok"},
+    ]))
+    runner.run("go", thread_id="t")
+    messages = runner.graph.get_state({"configurable": {"thread_id": "t"}}).values["messages"]
+    statuses = {m.name: m.status for m in messages if m.type == "tool"}
+    assert statuses == {"book": "success", "boom": "error", "nope": "error"}
+
+    client = FakeCMAClient(script=[{"calls": [BOOK_CALL, {"tool": "boom", "args": {"reason": "x"}}, {"tool": "nope", "args": {}}]}, {"text": "ok"}])
+    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
+    ClaudeManagedRunner(PARITY_SPEC, record, client=client).run("go")
+    flags = [e["is_error"] for e in client.sent if e["type"] == "user.custom_tool_result"]
+    assert flags == [False, True, True]
+
+
+def _two_node_custom_graph(spec, model, *, checkpointer=None):
+    """A graph_builder with its own node names, using the exported cap route."""
+    from langchain_core.messages import SystemMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, MessagesState, StateGraph
+    from langgraph.prebuilt import ToolNode
+
+    from mfa.runtime.graph import iteration_cap_route
+
+    tools = [t.to_langchain() for t in spec.tools]
+    bound = model.bind_tools(tools)
+    g = StateGraph(MessagesState)
+    g.add_node("model", lambda st: {"messages": [bound.invoke([SystemMessage(content=spec.system_prompt), *st["messages"]])]})
+    g.add_node("run_tools", ToolNode(tools))
+    g.add_node("post", lambda st: {})  # a third step per round, unlike the template
+    g.add_edge(START, "model")
+    g.add_conditional_edges("model", iteration_cap_route(spec, tools_node="run_tools"), {"run_tools": "run_tools", END: END})
+    g.add_edge("run_tools", "post")
+    g.add_edge("post", "model")
+    return g.compile(checkpointer=checkpointer or InMemorySaver())
+
+
+def test_custom_graph_builder_gets_the_same_cap_and_recovers():
+    from dataclasses import replace
+
+    spec = replace(PARITY_SPEC, graph_builder=_two_node_custom_graph)
+    ok = LocalRunner(spec, chat_model=ScriptedChatModel(script=[BOOK_CALL] * 2 + [{"text": "Done."}])).run("go")
+    assert ok.error is None and ok.output == "Done." and len(ok.tool_calls) == 2  # n rounds + answer pass
+
+    runner = LocalRunner(spec, chat_model=ScriptedChatModel(script=[BOOK_CALL] * 3 + [{"text": "Recovered."}]))
+    capped = runner.run("go", thread_id="t")
+    assert capped.error == iteration_limit_error(2) and len(capped.tool_calls) == 3
+    assert runner.graph.get_state({"configurable": {"thread_id": "t"}}).next == ()  # repaired without an "agent" node
+    assert shape(runner.run("again", thread_id="t")) == ("Recovered.", None, [])
+
+
+def test_interrupt_before_graph_is_left_pending_not_reported_as_the_cap():
+    from dataclasses import replace
+
+    def hitl(spec, model, *, checkpointer=None):
+        from langchain_core.messages import SystemMessage
+        from langgraph.checkpoint.memory import InMemorySaver
+        from langgraph.graph import END, START, MessagesState, StateGraph
+        from langgraph.prebuilt import ToolNode, tools_condition
+
+        tools = [t.to_langchain() for t in spec.tools]
+        bound = model.bind_tools(tools)
+        g = StateGraph(MessagesState)
+        g.add_node("agent", lambda st: {"messages": [bound.invoke([SystemMessage(content=spec.system_prompt), *st["messages"]])]})
+        g.add_node("tools", ToolNode(tools))
+        g.add_edge(START, "agent")
+        g.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
+        g.add_edge("tools", "agent")
+        return g.compile(checkpointer=checkpointer or InMemorySaver(), interrupt_before=["tools"])
+
+    runner = LocalRunner(replace(PARITY_SPEC, graph_builder=hitl), chat_model=ScriptedChatModel(script=[BOOK_CALL, {"text": "x"}]))
+    r = runner.run("go", thread_id="t")
+    assert r.error is None and r.metadata["pending_nodes"] == ["tools"]
+    assert [(c.name, c.output) for c in r.tool_calls] == [("book", None)]  # waiting for approval, not refused
+    assert runner.graph.get_state({"configurable": {"thread_id": "t"}}).next == ("tools",)

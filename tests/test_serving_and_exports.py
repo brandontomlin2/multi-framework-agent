@@ -258,9 +258,44 @@ def test_cloud_run_runner_retries_transient_errors_and_refreshes_token(monkeypat
     assert r.error is None and r.output == "ok" and r.metadata["attempts"] == 3
     assert attempts == ["Bearer tok-1", "Bearer tok-1", "Bearer tok-2"]  # 401 forced a fresh token
 
-    def always_500(req, timeout):
-        raise urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
+    # Anything that may have reached the app is not retried: a retry would run the turn twice.
+    for status in (500, 502, 504, 403):
+        def not_again(req, timeout, status=status):
+            raise urllib.error.HTTPError(req.full_url, status, "boom", {}, None)
 
-    monkeypatch.setattr("urllib.request.urlopen", always_500)
-    r = CloudRunRunner("http://svc", retries=1).run("q")
-    assert r.error.startswith("HTTP 500") and r.metadata["attempts"] == 2
+        monkeypatch.setattr("urllib.request.urlopen", not_again)
+        r = CloudRunRunner("http://svc", retries=3).run("q")
+        assert r.error.startswith(f"HTTP {status}") and r.metadata["attempts"] == 1
+
+    def read_timeout(req, timeout):
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr("urllib.request.urlopen", read_timeout)
+    assert CloudRunRunner("http://svc", retries=3).run("q").metadata["attempts"] == 1
+
+    def refused(req, timeout):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+
+    monkeypatch.setattr("urllib.request.urlopen", refused)
+    assert CloudRunRunner("http://svc", retries=2).run("q").metadata["attempts"] == 3  # never reached the app
+
+
+def test_cloud_run_runner_caches_a_missing_token_too(monkeypatch):
+    fetches = []
+    monkeypatch.setattr("mfa.targets.cloud_run._identity_token", lambda aud: fetches.append(aud) or None)
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"target": "cloud_run", "input": "q", "output": "ok"}).encode()
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout: _Resp())
+    runner = CloudRunRunner("http://localhost:8080")
+    for _ in range(5):
+        assert runner.run("q").output == "ok"
+    assert len(fetches) == 1  # public / local service: no token, and no gcloud subprocess per request

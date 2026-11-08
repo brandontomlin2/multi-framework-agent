@@ -38,9 +38,12 @@ def environment_snapshot() -> dict[str, str]:
 
 
 def wilson_interval(passed: int, total: int, z: float = 1.96) -> tuple[float, float]:
-    """95% confidence interval for a pass rate from ``passed``/``total`` Bernoulli trials."""
+    """95% confidence interval for a pass rate from ``passed``/``total`` Bernoulli trials.
+
+    No data means no information: ``(0.0, 1.0)``.
+    """
     if total == 0:
-        return (0.0, 0.0)
+        return (0.0, 1.0)
     p = passed / total
     denom = 1 + z * z / total
     centre = (p + z * z / (2 * total)) / denom
@@ -76,6 +79,19 @@ class EvalReport(BaseModel):
     def pass_rate(self) -> float:
         return sum(c.passed for c in self.cases) / len(self.cases) if self.cases else 0.0
 
+    def pass_rate_ci95(self) -> tuple[float, float]:
+        """Wilson interval over *cases*, not runs.
+
+        Repeated trials of one case are not independent draws, so they refine the
+        per-case pass estimate but must not shrink the interval; the sample size
+        is the number of distinct cases.
+        """
+        n = len(self.case_ids)
+        if n == 0:
+            return (0.0, 1.0)
+        expected_passes = sum(p / t for p, t in (self.passes_for(cid) for cid in self.case_ids))
+        return wilson_interval(round(expected_passes, 6), n)  # type: ignore[arg-type]
+
     @property
     def case_ids(self) -> list[str]:
         return list(dict.fromkeys(c.case_id for c in self.cases))
@@ -99,7 +115,7 @@ class EvalReport(BaseModel):
             "runs": len(self.cases),
             "passed": passed,
             "pass_rate": round(self.pass_rate, 3),
-            "pass_rate_ci95": list(wilson_interval(passed, len(self.cases))),
+            "pass_rate_ci95": list(self.pass_rate_ci95()),
             "check_pass_rate": round(sum(ch.passed for ch in graded) / len(graded), 3) if graded else None,
             "judge_pass_rate": round(sum(ch.passed for ch in judge) / len(judge), 3) if judge else None,
             "judge_errors": sum(ch.error for ch in all_checks if ch.name == "judge"),
@@ -112,29 +128,36 @@ class EvalReport(BaseModel):
 
 
 def run_case(runner: Runner, case: EvalCase, judge: Judge | None, trial: int = 0) -> CaseResult:
-    """Run every turn of one case on one thread and grade it. Never raises."""
+    """Run every turn of one case on one thread and grade it. Never raises.
+
+    A runner that raises fails the case with a ``harness`` check. A grader that
+    raises also fails the case, but keeps the agent's trajectory and marks the
+    check ungraded (``error=True``) so the report shows what could not be judged.
+    """
     thread_id = f"eval-{case.id}-{trial}-{uuid.uuid4().hex[:8]}"
     try:
         turns = [runner.run(t, thread_id=thread_id) for t in case.turns]
-        last = turns[-1]
-        combined = AgentResult(
-            target=last.target,
-            input="\n".join(case.turns),
-            output=last.output,
-            tool_calls=[c for t in turns for c in t.tool_calls],
-            latency_s=round(sum(t.latency_s or 0 for t in turns), 3),
-            error=next((t.error for t in turns if t.error), None),
-            metadata=last.metadata,
-        )
-        checks = grade(case, combined, judge, turns)
     except Exception as exc:
-        # A bug in a runner or grader fails this case, not the whole run.
         detail = f"{type(exc).__name__}: {exc}"
         combined = AgentResult(target=runner.target, input="\n".join(case.turns), output="", error=detail)
         return CaseResult(
             case_id=case.id, tags=case.tags, passed=False, trial=trial,
             checks=[Check(name="harness", passed=False, detail=detail)], result=combined, turns=[],
         )
+    last = turns[-1]
+    combined = AgentResult(
+        target=last.target,
+        input="\n".join(case.turns),
+        output=last.output,
+        tool_calls=[c for t in turns for c in t.tool_calls],
+        latency_s=round(sum(t.latency_s or 0 for t in turns), 3),
+        error=next((t.error for t in turns if t.error), None),
+        metadata=last.metadata,
+    )
+    try:
+        checks = grade(case, combined, judge, turns)
+    except Exception as exc:
+        checks = [Check(name="harness", passed=False, error=True, detail=f"grading failed: {type(exc).__name__}: {exc}")]
     passed = all(ch.passed is not False for ch in checks)
     return CaseResult(case_id=case.id, tags=case.tags, passed=passed, checks=checks, result=combined, turns=turns, trial=trial)
 
@@ -244,8 +267,10 @@ def compare(report_paths: list[str | Path]) -> str:
     lines.append("| runs | " + " | ".join(f"{s['runs']} ({s['trials']} trials)" for s in sums) + " |")
     lines.append("| judge errors | " + " | ".join(str(s["judge_errors"]) for s in sums) + " |")
     lines.append("| p50 latency (s) | " + " | ".join(str(s["latency_p50_s"]) for s in sums) + " |")
-    if any(s["pass_rate_ci95"][0] > o["pass_rate_ci95"][1] for s in sums for o in sums):
-        lines += ["", "Intervals do not overlap for at least one pair: the difference is unlikely to be sampling noise."]
-    else:
-        lines += ["", "All pass-rate intervals overlap: the differences are within sampling noise at these sample sizes."]
+    with_data = [s for s in sums if s["runs"]]
+    if len(with_data) >= 2:
+        if any(a["pass_rate_ci95"][0] > b["pass_rate_ci95"][1] for a in with_data for b in with_data):
+            lines += ["", "At least one pair of pass-rate intervals does not overlap: that difference is unlikely to be sampling noise."]
+        else:
+            lines += ["", "All pass-rate intervals overlap: no evidence of a difference at these sample sizes (more cases or trials would be needed to tell)."]
     return "\n".join(lines) + "\n"

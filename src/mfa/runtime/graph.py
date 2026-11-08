@@ -14,9 +14,10 @@ in a state the next turn can continue from.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -32,11 +33,12 @@ from mfa.spec import AgentSpec, iteration_limit_error, unknown_tool_error
 def recursion_limit_for(max_iterations: int) -> int:
     """Safety-net ``recursion_limit`` for a turn of ``max_iterations`` tool rounds.
 
-    The template graph enforces ``max_iterations`` itself (see ``build_graph``), so
-    this only guards custom ``graph_builder`` topologies. A turn with n rounds takes
-    2n+1 supersteps and LangGraph needs one spare tick to finish cleanly at the limit.
+    The iteration cap itself is enforced by ``iteration_cap_route`` (used by the
+    template graph; available to custom builders). This limit only stops a custom
+    graph that loops without ever calling a tool, so it is deliberately generous:
+    a round may take several supersteps in a custom topology.
     """
-    return max_iterations * 2 + 2
+    return max(50, max_iterations * 4 + 2)
 
 
 def tool_rounds_this_turn(messages: list[BaseMessage]) -> int:
@@ -50,43 +52,57 @@ def tool_rounds_this_turn(messages: list[BaseMessage]) -> int:
     return rounds
 
 
-def build_graph(spec: AgentSpec, model: BaseChatModel, *, checkpointer: Any | None = None):
-    lc_tools = [t.to_langchain() for t in spec.tools]
-    bound = model.bind_tools(lc_tools) if lc_tools else model
-    system = SystemMessage(content=spec.system_prompt)
+def iteration_cap_route(spec: AgentSpec, *, tools_node: str = "tools") -> Callable[[MessagesState], str]:
+    """Conditional edge after the model node: run tools, or end the turn.
 
-    def call_model(state: MessagesState) -> dict:
-        return {"messages": [bound.invoke([system, *state["messages"]])]}
-
-    names = [t.name for t in lc_tools]
-
-    def _unknown(request):
-        tc = request.tool_call
-        return ToolMessage(
-            content=unknown_tool_error(tc["name"], names), name=tc["name"], tool_call_id=tc["id"], status="error"
-        )
-
-    def wrap_tool_call(request, execute):
-        # Same text as the Claude Managed Agents runner for a tool the spec does not define.
-        return _unknown(request) if request.tool is None else execute(request)
-
-    async def awrap_tool_call(request, execute):
-        return _unknown(request) if request.tool is None else await execute(request)
+    The call past ``spec.max_iterations`` tool rounds is not executed: the turn
+    ends on the dangling tool call and ``run_turn`` reports ``iteration_limit_error``,
+    the same way the Claude Managed Agents runner does. Custom ``graph_builder``
+    graphs can use this in place of ``tools_condition`` to get the same cap.
+    """
 
     def route(state: MessagesState) -> str:
         if tools_condition(state) == END:
             return END
-        # The call past the cap is not executed: the turn ends here and run_turn
-        # reports iteration_limit_error, the same way the CMA runner does.
-        return END if tool_rounds_this_turn(state["messages"]) > spec.max_iterations else "tools"
+        return END if tool_rounds_this_turn(state["messages"]) > spec.max_iterations else tools_node
+
+    return route
+
+
+def build_graph(spec: AgentSpec, model: BaseChatModel, *, checkpointer: Any | None = None):
+    lc_tools = [t.to_langchain() for t in spec.tools]
+    bound = model.bind_tools(lc_tools) if lc_tools else model
+    system = SystemMessage(content=spec.system_prompt)
+    names = [t.name for t in spec.tools]
+
+    def call_model(state: MessagesState) -> dict:
+        return {"messages": [bound.invoke([system, *state["messages"]])]}
+
+    def run_call(tc: dict) -> ToolMessage:
+        # Every target hands the model the text *and* the error flag ToolSpec.run
+        # produced; the Claude Managed Agents runner sends the same pair as
+        # user.custom_tool_result(is_error=...).
+        if tc["name"] not in names:
+            text, is_error = unknown_tool_error(tc["name"], names), True
+        else:
+            text, is_error = spec.tool_by_name(tc["name"]).run(dict(tc["args"]))
+        return ToolMessage(
+            content=text, name=tc["name"], tool_call_id=tc["id"], status="error" if is_error else "success"
+        )
+
+    def wrap_tool_call(request, execute):
+        return run_call(request.tool_call)
+
+    async def awrap_tool_call(request, execute):
+        return await asyncio.to_thread(run_call, request.tool_call)  # keep sync tools off the event loop
 
     g = StateGraph(MessagesState)
     g.add_node("agent", call_model)
     g.add_edge(START, "agent")
     if lc_tools:
-        # Tool failures never reach here: ToolSpec.run turns them into error text.
+        # The LangChain tools carry the schema for bind_tools; execution goes through run_call.
         g.add_node("tools", ToolNode(lc_tools, wrap_tool_call=wrap_tool_call, awrap_tool_call=awrap_tool_call))
-        g.add_conditional_edges("agent", route, {"tools": "tools", END: END})
+        g.add_conditional_edges("agent", iteration_cap_route(spec), {"tools": "tools", END: END})
         g.add_edge("tools", "agent")
     else:
         g.add_edge("agent", END)
@@ -131,10 +147,12 @@ def extract_result(messages: list[BaseMessage], *, target: str, user_input: str)
     return AgentResult(target=target, input=user_input, output=final, tool_calls=calls)
 
 
-def turn_error_text(exc: BaseException, max_iterations: int) -> str:
+def turn_error_text(exc: BaseException, max_iterations: int, messages: list[BaseMessage] | None = None) -> str:
     """Normalize a failed turn's exception into the error string shared with the other targets."""
     if isinstance(exc, GraphRecursionError):
-        return iteration_limit_error(max_iterations)
+        if messages is None or tool_rounds_this_turn(messages) > max_iterations:
+            return iteration_limit_error(max_iterations)
+        return f"GraphRecursionError: {exc}"  # a custom graph looped without exceeding the tool cap
     return f"{type(exc).__name__}: {exc}"
 
 
@@ -145,24 +163,62 @@ def dangling_tool_calls(messages: list[BaseMessage]) -> list[dict]:
     return list(messages[-1].tool_calls)
 
 
+def _fillers(messages: list[BaseMessage], error_text: str) -> list[ToolMessage]:
+    return [
+        ToolMessage(content=error_text, name=tc["name"], tool_call_id=tc["id"], status="error")
+        for tc in dangling_tool_calls(messages)
+    ]
+
+
+def _repair_node(graph) -> str | None:
+    # Writing as the model node makes the template's conditional edge route to END,
+    # so the checkpoint has no pending task and the next turn starts a fresh run.
+    # Custom graphs name their nodes freely: let LangGraph infer the writer there.
+    return "agent" if "agent" in getattr(graph, "nodes", {}) else None
+
+
 def repair_thread(graph, config: dict, error_text: str) -> list[BaseMessage]:
     """After a failed turn, answer any unanswered tool call so the thread stays valid for the next turn.
 
-    Returns the thread's messages after the repair.
+    Returns the thread's messages after the repair. Never raises: a repair that
+    fails leaves the thread as it was.
     """
     messages = list(graph.get_state(config).values.get("messages", []))
-    pending = dangling_tool_calls(messages)
-    if pending:
-        fillers = [
-            ToolMessage(content=error_text, name=tc["name"], tool_call_id=tc["id"], status="error")
-            for tc in pending
-        ]
-        # Written as the agent node: the conditional edge then routes to END, so the
-        # checkpoint has no pending task and the next turn starts a fresh run with a
-        # full recursion budget (as the tools node it would leave "agent" pending).
-        graph.update_state(config, {"messages": fillers}, as_node="agent")
-        messages.extend(fillers)
+    fillers = _fillers(messages, error_text)
+    if fillers:
+        try:
+            graph.update_state(config, {"messages": fillers}, as_node=_repair_node(graph))
+            messages.extend(fillers)
+        except Exception:
+            pass
     return messages
+
+
+async def arepair_thread(graph, config: dict, error_text: str) -> list[BaseMessage]:
+    """``repair_thread`` for async callers (an async-only checkpointer must not be driven synchronously)."""
+    messages = list((await graph.aget_state(config)).values.get("messages", []))
+    fillers = _fillers(messages, error_text)
+    if fillers:
+        try:
+            await graph.aupdate_state(config, {"messages": fillers}, as_node=_repair_node(graph))
+            messages.extend(fillers)
+        except Exception:
+            pass
+    return messages
+
+
+def capped_turn(messages: list[BaseMessage], pending_nodes: tuple, max_iterations: int) -> bool:
+    """True when a turn ended on a refused tool call because of the iteration cap.
+
+    A graph compiled with ``interrupt_before`` also returns with a dangling tool
+    call, but then it has a pending node and the cap was not exceeded; that turn
+    is left untouched for the caller to resume.
+    """
+    return (
+        bool(dangling_tool_calls(messages))
+        and not pending_nodes
+        and tool_rounds_this_turn(messages) > max_iterations
+    )
 
 
 def run_turn(graph, user_input: str, *, thread_id: str, target: str, max_iterations: int) -> AgentResult:
@@ -175,19 +231,23 @@ def run_turn(graph, user_input: str, *, thread_id: str, target: str, max_iterati
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": recursion_limit_for(max_iterations)}
     start = time.monotonic()
     before = len(graph.get_state(config).values.get("messages", []))
+    pending: tuple = ()
     try:
         state = graph.invoke({"messages": [HumanMessage(content=user_input)]}, config)
         messages = state["messages"]
         error = None
-        if dangling_tool_calls(messages):
-            # The graph ended on a tool call it refused to run: the iteration cap.
+        pending = tuple(graph.get_state(config).next or ())
+        if capped_turn(messages, pending, max_iterations):
             error = iteration_limit_error(max_iterations)
             messages = repair_thread(graph, config, error)
     except Exception as exc:
-        error = turn_error_text(exc, max_iterations)
+        messages = list(graph.get_state(config).values.get("messages", []))
+        error = turn_error_text(exc, max_iterations, messages)
         messages = repair_thread(graph, config, error)
     result = extract_result(messages[before:], target=target, user_input=user_input)
     result.error = error
     result.latency_s = round(time.monotonic() - start, 3)
     result.metadata["thread_id"] = thread_id
+    if pending:
+        result.metadata["pending_nodes"] = list(pending)  # e.g. a custom graph waiting at interrupt_before
     return result

@@ -125,19 +125,21 @@ class ClaudeManagedRunner:
         calls: list[ToolCall] = []
         final_text = ""
         error: str | None = None
-        rounds = 0  # custom tool calls answered this turn
+        rounds = 0  # model messages that called tools this turn (one message may hold several calls)
+        in_round = False
+        refused: list[dict[str, Any]] = []  # results for the round past the cap, sent with the interrupt
         server_retries = 0
         limit_text = iteration_limit_error(self.spec.max_iterations)
 
+        def send(*events: dict[str, Any]) -> None:
+            sessions.events.send(session_id=session_id, events=list(events))
+
         # Stream-first: open the stream, then send, so no early events are missed.
         with sessions.events.stream(session_id=session_id) as stream:
-            sessions.events.send(
-                session_id=session_id,
-                events=[{"type": "user.message", "content": [{"type": "text", "text": user_input}]}],
-            )
+            send({"type": "user.message", "content": [{"type": "text", "text": user_input}]})
             for event in stream:
                 if time.monotonic() - start > DEFAULT_TURN_TIMEOUT_S:
-                    sessions.events.send(session_id=session_id, events=[{"type": "user.interrupt"}])
+                    send({"type": "user.interrupt"})
                     error = f"turn exceeded {DEFAULT_TURN_TIMEOUT_S}s"
                     break
 
@@ -146,38 +148,37 @@ class ClaudeManagedRunner:
                     if text:
                         final_text = text  # last message of the turn, same rule as LangGraph
                 elif event.type == "agent.custom_tool_use":
+                    # Managed Agents emits one event per tool_use block of a model message,
+                    # then one requires_action idle; the idle closes the round, so parallel
+                    # calls count as one round, exactly like one AIMessage in the graph.
+                    if not in_round:
+                        rounds += 1
+                        in_round = True
                     args = dict(event.input or {})
-                    rounds += 1
-                    if rounds > self.spec.max_iterations:
-                        # Same cap as the LangGraph graph: the call past the limit is not
-                        # executed and the turn is stopped; the trajectory records the
-                        # refused call with the limit error as its output.
-                        calls.append(ToolCall(name=event.name, args=args, output=limit_text))
+                    past_cap = rounds > self.spec.max_iterations
+                    if past_cap:
+                        # Same rule as iteration_cap_route: the round past the cap is not executed.
+                        output, is_error = limit_text, True
                         error = limit_text
-                        sessions.events.send(session_id=session_id, events=[{"type": "user.interrupt"}])
-                        continue
-                    output, is_error = self._tool_result(event.name, args)
+                    else:
+                        output, is_error = self._tool_result(event.name, args)
                     calls.append(ToolCall(name=event.name, args=args, output=output))
-                    sessions.events.send(
-                        session_id=session_id,
-                        events=[
-                            {
-                                "type": "user.custom_tool_result",
-                                "custom_tool_use_id": event.id,
-                                "content": [{"type": "text", "text": output}],
-                                "is_error": is_error,
-                            }
-                        ],
-                    )
+                    result_event = {
+                        "type": "user.custom_tool_result",
+                        "custom_tool_use_id": event.id,
+                        "content": [{"type": "text", "text": output}],
+                        "is_error": is_error,
+                    }
+                    if past_cap:
+                        refused.append(result_event)  # answered together with the interrupt below
+                    else:
+                        send(result_event)
                 elif event.type in ("agent.tool_use", "agent.mcp_tool_use"):
                     # Only present when the built-in toolset is enabled. Eval runs are
                     # unattended, so a call the server paused for approval is denied.
                     calls.append(ToolCall(name=event.name, args=dict(getattr(event, "input", {}) or {})))
                     if getattr(event, "evaluated_permission", None) == "ask":
-                        sessions.events.send(
-                            session_id=session_id,
-                            events=[{"type": "user.tool_confirmation", "tool_use_id": event.id, "result": "deny"}],
-                        )
+                        send({"type": "user.tool_confirmation", "tool_use_id": event.id, "result": "deny"})
                 elif event.type == "session.error":
                     err = getattr(event, "error", None)
                     retry = getattr(getattr(err, "retry_status", None), "type", None)
@@ -191,10 +192,18 @@ class ClaudeManagedRunner:
                     error = error or f"{kind}: {message}"
                 elif event.type == "session.status_idle":
                     reason = event.stop_reason.type
-                    if reason != "requires_action":
-                        if reason != "end_turn":
-                            error = error or f"session stopped: {reason}"
-                        break
+                    if reason == "requires_action":
+                        in_round = False  # all tool calls of this model message have been delivered
+                        if refused:
+                            # Answer every refused call so the session is not left waiting on
+                            # them, and stop the turn in the same batch (an interrupted turn
+                            # ends with end_turn).
+                            send(*refused, {"type": "user.interrupt"})
+                            refused = []
+                        continue
+                    if reason != "end_turn":
+                        error = error or f"session stopped: {reason}"
+                    break
                 elif event.type == "session.status_terminated":
                     error = error or "session terminated"
                     break

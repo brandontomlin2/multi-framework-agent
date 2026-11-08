@@ -134,9 +134,9 @@ One eval suite can grade four runtimes only because they agree on what a turn re
 | Situation | Every target does |
 |---|---|
 | Tool arguments | Validated and coerced against the tool's schema in `ToolSpec.run` (`"2"` → `2`, `"2026-11-08"` → `date`). Invalid arguments become `Error: invalid arguments for <tool>: ...` handed back to the model; the turn goes on. |
-| Tool raises | `Error: tool <tool> failed: <Exception>: ...` handed back to the model; the turn goes on. |
+| Tool raises | `Error: tool <tool> failed: <Exception>: ...` handed back to the model, flagged as an error (`ToolMessage.status="error"` on LangGraph, `is_error: true` on CMA); the turn goes on. |
 | Unknown tool name | `Error: unknown tool <name>; available tools: ...` handed back to the model. |
-| More than `max_iterations` tool rounds | The call past the cap is not executed. The turn ends with `AgentResult.error = "Error: iteration limit reached: max_iterations=N"`; the trajectory keeps the executed calls plus the refused one (its `output` is that error). The thread stays usable for the next turn. |
+| More than `max_iterations` tool rounds | A round is one assistant message, however many tool calls it holds. The round past the cap is not executed. The turn ends with `AgentResult.error = "Error: iteration limit reached: max_iterations=N"`; the trajectory keeps the executed calls plus the refused ones (their `output` is that error). The thread stays usable for the next turn. |
 | Any other failure | `AgentResult.error` is set and the partial trajectory is kept. `/mfa/query` still answers 200; A2A marks the task `failed` with the same text. |
 | Final reply | The last non-empty assistant message of the turn, on `/mfa/query`, A2A and CMA alike. |
 | Transient platform retries | Invisible: the Claude Managed Agents runner ignores `session.error` events the server is retrying (counted in `metadata.server_retries`) and only reports exhausted or terminal errors. |
@@ -174,7 +174,7 @@ cases:
 ```
 
 - **Passing:** a case passes when no check fails. A judge that is switched off (`--no-judge`) is a skip and doesn't fail a case. A judge that *could not run* (API error, refusal) is recorded as ungraded: it is not a pass, the report counts it under `judge_errors`, and `mfa eval` exits 1 when a gate is set unless you pass `--allow-ungraded`. A case whose runner or grader raises is a failed case with a `harness` check; it never discards the run.
-- **Trials:** `--trials N` runs every case N times. Pass rates then carry a 95% Wilson interval, the table shows `passed/runs` per case, and `mfa compare` says whether two targets' intervals overlap, so one flaky case is not read as a platform difference.
+- **Trials:** `--trials N` runs every case N times. The table shows `passed/runs` per case and `mfa compare` says whether two targets' pass-rate intervals overlap. The 95% Wilson interval is computed over *cases* (trials refine each case's pass estimate but are not independent samples, so they never shrink the interval); more distinct cases are what narrows it.
 - **Environment:** every report records the non-secret `MFA_*` variables in effect (for example `MFA_WEATHER_PROVIDER`), so a cross-target difference can be traced to data, not only to the platform.
 - **Reports:** `eval_results/<agent>/<target>-<timestamp>.{json,md}` record per-case checks, per-turn tool trajectories, latency, and CMA session IDs (which you can open in the Console session viewer).
 - **Gemini format:** `mfa export -t gemini_eval` converts any report, from any target, into the Gemini platform `EvaluationDataset` shape (`eval_cases[].agent_data.turns[].events[]`, with `function_call` / `function_response` parts). The rubric and mfa's own checks travel as extra fields for custom metrics.
@@ -190,7 +190,7 @@ cp -r agents/_template agents/my_agent
 3. In `evals/cases.yaml`, write the cases.
 4. Run `mfa eval my_agent -t local`, then `mfa deploy my_agent -t cloud_run,claude_managed`, then `mfa eval my_agent -t all`.
 
-Bringing an existing LangGraph graph: set `AgentSpec.graph_builder=lambda spec, model, *, checkpointer: <compiled graph>`. Its state needs a `messages` key. That graph is what `local`, `agent_engine` and `cloud_run` serve.
+Bringing an existing LangGraph graph: set `AgentSpec.graph_builder=lambda spec, model, *, checkpointer: <compiled graph>`. Its state needs a `messages` key. That graph is what `local`, `agent_engine` and `cloud_run` serve. To keep the iteration cap identical to the other targets, route after your model node with `mfa.runtime.graph.iteration_cap_route(spec, tools_node="<your tools node>")` instead of `tools_condition`; without it, only a generous `recursion_limit` safety net applies. A graph compiled with `interrupt_before` returns with the tool call pending: `run_turn` leaves it untouched and reports the waiting nodes in `metadata["pending_nodes"]`.
 
 ## Notes and limits
 
@@ -198,7 +198,7 @@ Bringing an existing LangGraph graph: set `AgentSpec.graph_builder=lambda spec, 
 - **Packaging:** both Gemini targets copy `src/mfa` and `agents/` and pin LangGraph, LangChain and SDK versions to your local install. Run deploys from a repo checkout (`pip install -e .`).
 - **CMA sandbox:** `limited` networking with no allowed hosts, because tools run host-side. The built-in toolset is off so the agent has exactly the spec's tools. `MFA_CMA_ENABLE_TOOLSET=1` adds it, with web tools still off. Any tool call the server pauses for approval during an eval is denied. Environment names are unique per workspace, so a deploy reuses `<agent>-env` if it exists.
 - **CMA turn timeout:** `MFA_CMA_TURN_TIMEOUT_S` (default 600). It is checked as events arrive, and the turn is interrupted when it is exceeded.
-- **Cloud Run runner:** the identity token is refreshed before it expires and transient failures (connection errors, 429, 5xx) are retried with backoff, `MFA_CLOUD_RUN_RETRIES` times (default 3). A 401/403 fetches a fresh token.
+- **Cloud Run runner:** the identity token is refreshed before it expires (and once on a 401). Only failures that prove the request never reached the app are retried (connection refused, DNS, 429, 503), `MFA_CLOUD_RUN_RETRIES` times (default 3) with backoff; read timeouts and other 5xx are not, because a retry would run the same turn twice on the thread. The client timeout (960 s) is longer than the service's 900 s so the client never gives up first.
 - **Cost:** live evals call real models. A full run is 11 cases per target per trial plus one judge call per case.
 
 ## References

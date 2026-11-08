@@ -136,7 +136,8 @@ def test_trials_give_per_case_counts_and_an_interval(tmp_path):
     assert lo < 0.5 < hi
     assert "| flip | 2/4 |" in to_markdown(report)
     p, _ = save_report(report, tmp_path)
-    assert "2/4" in compare([p]) and "within sampling noise" in compare([p, p])
+    assert "2/4" in compare([p]) and "sampling noise" not in compare([p])  # one report: nothing to compare
+    assert "no evidence of a difference" in compare([p, p])
 
 
 def test_report_records_non_secret_environment(monkeypatch):
@@ -145,3 +146,54 @@ def test_report_records_non_secret_environment(monkeypatch):
     report = run_eval(agent="d", runner=CannedRunner("local", {}), cases=[EvalCase(id="e", input="q")], judge=None)
     assert report.environment["MFA_WEATHER_PROVIDER"] == "fixture"
     assert "MFA_ANTHROPIC_API_KEY" not in report.environment
+
+
+def test_interval_is_over_cases_not_runs_and_no_data_means_no_information():
+    from mfa.evals.harness import wilson_interval
+
+    assert wilson_interval(0, 0) == (0.0, 1.0)
+    cases = [EvalCase(id=f"c{i}", input="q", expect={"output_contains": ["ok"]}) for i in range(11)]
+    one_run = run_eval(agent="d", runner=CannedRunner("local", {"q": ("ok", [])}), cases=cases, judge=None)
+    many = run_eval(agent="d", runner=CannedRunner("local", {"q": ("ok", [])}), cases=cases, judge=None, trials=5)
+    # 55 correlated runs must not look like 55 independent cases.
+    assert many.summary()["pass_rate_ci95"] == one_run.summary()["pass_rate_ci95"]
+
+
+def test_grader_crash_keeps_the_trajectory_and_is_ungraded():
+    def exploding_judge(case, result, turns):
+        raise ValueError("verdict was not JSON")
+
+    case = EvalCase(id="j", input="q", judge="rubric")
+    report = run_eval(agent="d", runner=CannedRunner("local", {"q": ("hello", [("t", {})])}), cases=[case], judge=exploding_judge)
+    c = report.cases[0]
+    assert not c.passed and c.result.output == "hello" and c.result.tool_names == ["t"] and c.result.error is None
+    assert c.checks[0].name == "harness" and c.checks[0].error and "verdict was not JSON" in c.checks[0].detail
+    assert "Not graded" in to_markdown(report)
+
+
+def test_export_keeps_eval_case_ids_unique_across_trials():
+    from mfa.evals.export import to_gemini_eval_dataset
+
+    cases = [EvalCase(id="a", input="q"), EvalCase(id="b", input="q")]
+    report = run_eval(agent="d", runner=CannedRunner("local", {"q": ("ok", [])}), cases=cases, judge=None, trials=2)
+    ids = [c["eval_case_id"] for c in to_gemini_eval_dataset(report)["eval_cases"]]
+    assert len(ids) == len(set(ids)) == 4 and {c["mfa_trial"] for c in to_gemini_eval_dataset(report)["eval_cases"]} == {0, 1}
+    single = run_eval(agent="d", runner=CannedRunner("local", {"q": ("ok", [])}), cases=cases, judge=None)
+    assert [c["eval_case_id"] for c in to_gemini_eval_dataset(single)["eval_cases"]] == ["a", "b"]
+
+
+def test_cli_gate_fails_on_ungraded_checks_only_when_gated(monkeypatch, tmp_path, capsys):
+    from mfa import cli
+
+    class AlwaysAsks(CannedRunner):
+        def run(self, user_input, *, thread_id=None):
+            return AgentResult(target=self.target, input=user_input, output="Which city do you mean?", latency_s=0.1)
+
+    monkeypatch.setattr(cli, "_runner", lambda spec, target, args: AlwaysAsks("local", {}))
+    errored = Check(name="judge", passed=None, error=True, detail="judge error: 429")
+    monkeypatch.setattr("mfa.evals.claude_judge", lambda model, effort: (lambda c, r, t: errored))
+    base = ["eval", "weather_agent", "-t", "local", "--case", "asks_for_location", "--out", str(tmp_path)]
+    assert cli.main(base) == 0  # exploratory run: reported, not failed
+    assert cli.main([*base, "--min-pass-rate", "0.5"]) == 1  # gated run: an ungraded check is not a pass
+    assert "could not be graded" in capsys.readouterr().err
+    assert cli.main([*base, "--min-pass-rate", "0.5", "--allow-ungraded"]) == 0

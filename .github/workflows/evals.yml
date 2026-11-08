@@ -45,12 +45,20 @@ jobs:
       # restore them from your own storage before running remote targets.
       - name: eval
         env:
+          # Inputs reach the shell as variables, never as script text (no injection, no globbing).
+          AGENT: ${{ inputs.agent }}
+          TARGET: ${{ inputs.target }}
+          MIN_PASS_RATE: ${{ inputs.min_pass_rate }}
+          TRIALS: ${{ inputs.trials }}
+          EXTRA_ENV: ${{ inputs.extra_env }}
           # Only this step sees the key; dependency installation above does not.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          for kv in ${{ inputs.extra_env }}; do export "$kv"; done
-          mfa eval ${{ inputs.agent }} --target ${{ inputs.target }} \
-            --min-pass-rate ${{ inputs.min_pass_rate }} --trials ${{ inputs.trials }}
+          set -f
+          for kv in $EXTRA_ENV; do
+            case "$kv" in MFA_*=*) export "$kv" ;; *) echo "ignoring extra_env entry '$kv' (only MFA_*=... is allowed)" ;; esac
+          done
+          mfa eval "$AGENT" --target "$TARGET" --min-pass-rate "$MIN_PASS_RATE" --trials "$TRIALS"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -124,8 +124,8 @@ def cmd_eval(args) -> int:
     if args.min_pass_rate is not None and worst < args.min_pass_rate:
         print(f"FAIL: pass rate {worst:.0%} < required {args.min_pass_rate:.0%}", file=sys.stderr)
         failed = True
-    if ungraded and not args.allow_ungraded:
-        # A verdict with ungraded checks is not a verdict; never let the gate pass on it.
+    if ungraded and args.min_pass_rate is not None and not args.allow_ungraded:
+        # A gated verdict with ungraded checks is not a verdict; never let the gate pass on it.
         print(f"FAIL: {ungraded} check(s) could not be graded (judge or harness errors); "
               "re-run, or pass --allow-ungraded to report them without failing", file=sys.stderr)
         failed = True
@@ -265,7 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--min-pass-rate", type=float, help="exit 1 if any target scores below this (0-1)")
     e.add_argument("--trials", type=int, default=1, help="run every case this many times (pass rate gets a 95%% CI)")
     e.add_argument("--allow-ungraded", action="store_true",
-                   help="do not exit 1 when judge/harness errors leave checks ungraded")
+                   help="with --min-pass-rate: do not exit 1 when judge/harness errors leave checks ungraded")
     e.add_argument("--url", help="cloud_run: evaluate this URL instead of the deployed one")
     e.set_defaults(func=cmd_eval)
 

@@ -7,6 +7,7 @@ Both fakes replay the same *script* format, so one scenario can be run through
 every target and the results compared:
 
 * ``{"tool": name, "args": {...}}``          the model calls a tool
+* ``{"calls": [{"tool": ..., "args": ...}, ...]}``  several tool calls in one model message
 * ``{"text": "..."}``                         the model answers
 * ``{"text": "...", "tool": name, "args": {...}}``  text and a tool call in one message
 * ``{"error": {"type": ..., "retry_status": ..., "message": ...}}``  (CMA only) a
@@ -53,23 +54,34 @@ class ScriptedChatModel(BaseChatModel):
         step = self.script[self.cursor]
         self.cursor += 1
         step = {k: v for k, v in step.items() if k != "error"}  # CMA-only steps are no-ops here
-        if "tool" in step:
+        calls = step_calls(step)
+        if calls:
             msg = AIMessage(
                 content=step.get("text", ""),
-                tool_calls=[{"name": step["tool"], "args": step["args"], "id": f"call_{uuid.uuid4().hex[:8]}"}],
+                tool_calls=[{"name": c["tool"], "args": c["args"], "id": f"call_{uuid.uuid4().hex[:8]}"} for c in calls],
             )
         else:
             msg = AIMessage(content=step["text"])
         return ChatResult(generations=[ChatGeneration(message=msg)])
 
 
+def step_calls(step: dict[str, Any]) -> list[dict[str, Any]]:
+    """The tool calls a script step makes (zero, one, or several)."""
+    if "calls" in step:
+        return list(step["calls"])
+    return [{"tool": step["tool"], "args": step["args"]}] if "tool" in step else []
+
+
 class FakeCMAClient:
     """Mimics client.beta.{environments,agents,sessions} enough for deploy + runner tests.
 
-    For each session turn it replays the script above: tool steps become
-    ``agent.custom_tool_use`` events (and wait for the runner's
-    ``user.custom_tool_result``), text steps become ``agent.message``, error
-    steps become ``session.error``. ``user.interrupt`` ends the turn.
+    For each session turn it replays the script above the way the service
+    streams it: a tool step becomes one ``agent.custom_tool_use`` event per call
+    followed by a single ``session.status_idle(requires_action)``; the model only
+    continues (next script step) once every call has a ``user.custom_tool_result``;
+    text steps become ``agent.message``; error steps become ``session.error``.
+    ``user.interrupt`` stops a running model step; while tool calls are still
+    unresolved it does nothing, as on the service.
     """
 
     def __init__(self, script: list[dict[str, Any]] | None = None):
@@ -88,6 +100,7 @@ class FakeCMAClient:
             ),
         )
         self._pending: list[Any] = []
+        self._unresolved: set[str] = set()
         self._version = 0
 
     # control plane
@@ -114,12 +127,18 @@ class FakeCMAClient:
     # data plane
     def _send(self, *, session_id, events):
         self.sent.extend(events)
+        interrupt = any(e["type"] == "user.interrupt" for e in events)
         for e in events:
-            if e["type"] == "user.interrupt":
-                self._pending.clear()
-                self._pending.append(_idle("end_turn"))
-            elif e["type"] in ("user.message", "user.custom_tool_result"):
+            if e["type"] == "user.message":
                 self._advance()
+            elif e["type"] == "user.custom_tool_result":
+                self._unresolved.discard(e["custom_tool_use_id"])
+                if not self._unresolved and not interrupt:
+                    self._advance()  # every call answered: the model runs again
+        if interrupt and not self._unresolved:
+            # Stops the running step before it produced anything; the turn ends idle.
+            self._pending.clear()
+            self._pending.append(_idle("end_turn"))
 
     def _advance(self):
         if not self.script:
@@ -148,11 +167,14 @@ class FakeCMAClient:
             self._pending.append(
                 SimpleNamespace(type="agent.message", content=[SimpleNamespace(type="text", text=step["text"])])
             )
-        if "tool" in step:
-            self._pending.append(
-                SimpleNamespace(type="agent.custom_tool_use", id=f"sevt_{uuid.uuid4().hex[:6]}",
-                                name=step["tool"], input=step["args"])
-            )
+        calls = step_calls(step)
+        if calls:
+            for c in calls:
+                ev_id = f"sevt_{uuid.uuid4().hex[:6]}"
+                self._unresolved.add(ev_id)
+                self._pending.append(
+                    SimpleNamespace(type="agent.custom_tool_use", id=ev_id, name=c["tool"], input=c["args"])
+                )
             self._pending.append(_idle("requires_action"))
         elif step.get("end_turn", True):
             self._pending.append(_idle("end_turn"))

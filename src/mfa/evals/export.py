@@ -44,7 +44,8 @@ def to_gemini_eval_dataset(report: EvalReport, *, cases_by_id: dict | None = Non
             turns_out.append({"turn_index": i, "events": events})
 
         case: dict[str, Any] = {
-            "eval_case_id": c.case_id,
+            # Trials repeat a case; downstream graders key on eval_case_id, so keep ids unique.
+            "eval_case_id": f"{c.case_id}#{c.trial}" if report.trials > 1 else c.case_id,
             "agent_data": {
                 "agents": {agent: {"agent_id": agent, "description": f"{agent} on {report.target}"}},
                 "turns": turns_out,
@@ -53,6 +54,7 @@ def to_gemini_eval_dataset(report: EvalReport, *, cases_by_id: dict | None = Non
             "mfa_target": report.target,
             "mfa_model": report.model,
             "mfa_passed": c.passed,
+            "mfa_trial": c.trial,
             "mfa_checks": [ch.model_dump() for ch in c.checks],
         }
         source = (cases_by_id or {}).get(c.case_id)

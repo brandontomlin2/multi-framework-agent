@@ -150,9 +150,11 @@ def claude_judge(model: str | None = None, effort: str | None = None) -> Judge:
                 betas=["server-side-fallback-2026-07-01"],
                 fallbacks="default",
             )
-        except anthropic.APIError as exc:
+        except Exception as exc:
+            # APIError, but also the SDK's pydantic ValidationError when the verdict
+            # text is not a complete _Verdict (e.g. truncated at max_tokens).
             return Check(name="judge", passed=None, error=True, detail=f"judge error: {exc!r}")
-        if resp.stop_reason == "refusal" or resp.parsed_output is None:
+        if resp.stop_reason in ("refusal", "max_tokens") or resp.parsed_output is None:
             return Check(name="judge", passed=None, error=True, detail=f"judge returned no verdict ({resp.stop_reason})")
         v = resp.parsed_output
         return Check(name="judge", passed=v.passed, detail=v.reasoning)

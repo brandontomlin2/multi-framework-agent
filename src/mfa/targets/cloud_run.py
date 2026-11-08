@@ -12,8 +12,10 @@ MFA_CLOUD_RUN_ALLOW_UNAUTHENTICATED=1 (public endpoint; off by default).
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import socket
 import subprocess
 import tempfile
 import time
@@ -51,29 +53,33 @@ def _identity_token(audience: str) -> str | None:
 
 
 TOKEN_TTL_S = 50 * 60  # Google ID tokens live 60 minutes; refresh well before that
-RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+# Only responses that prove the request never reached the app are retried: a retry
+# re-sends the turn on the same thread, which would double a turn that did run.
+RETRY_STATUSES = {429, 503}
+DEFAULT_TIMEOUT_S = 960  # longer than the service's --timeout=900, so the client never gives up first
 
 
 class CloudRunRunner:
     """Calls ``POST /mfa/query`` on the deployed service.
 
     The identity token is refreshed before it expires (long eval runs used to
-    fail wholesale after an hour) and transient failures - connection errors,
-    429 and 5xx - are retried with backoff so platform hiccups are not graded
-    as agent failures.
+    fail wholesale after an hour) and failures that provably happened before the
+    app saw the request - connection refused, DNS, 429, 503, and one 401 for an
+    expired token - are retried with backoff. Read timeouts and 5xx that may
+    follow a started turn are not retried, so a thread is never run twice.
     """
 
     target = CLOUD_RUN
 
-    def __init__(self, url: str, timeout_s: float = 600, retries: int | None = None):
+    def __init__(self, url: str, timeout_s: float = DEFAULT_TIMEOUT_S, retries: int | None = None):
         self.url = url.rstrip("/")
         self.timeout_s = timeout_s
         self.retries = int(os.environ.get("MFA_CLOUD_RUN_RETRIES", "3")) if retries is None else retries
         self._token: str | None = None
-        self._token_at = 0.0
+        self._token_at: float | None = None  # None = never fetched; a None token is cached too
 
     def _bearer(self, *, refresh: bool = False) -> str | None:
-        if refresh or self._token is None or time.monotonic() - self._token_at > TOKEN_TTL_S:
+        if refresh or self._token_at is None or time.monotonic() - self._token_at > TOKEN_TTL_S:
             self._token = _identity_token(self.url)
             self._token_at = time.monotonic()
         return self._token
@@ -86,22 +92,32 @@ class CloudRunRunner:
         with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
             return json.loads(resp.read())
 
+    @staticmethod
+    def _never_reached_app(exc: urllib.error.URLError) -> bool:
+        reason = exc.reason
+        return isinstance(reason, (ConnectionRefusedError, socket.gaierror)) or (
+            isinstance(reason, OSError) and getattr(reason, "errno", None) in (errno.ECONNREFUSED, errno.EHOSTUNREACH)
+        )
+
     def run(self, user_input: str, *, thread_id: str | None = None) -> AgentResult:
         start = time.monotonic()
         body = json.dumps({"input": user_input, "thread_id": thread_id}).encode()
         attempt = 0
         refresh = False
+        refreshed = False
         while True:
             attempt += 1
             try:
                 payload = self._post_once(body, refresh_token=refresh)
                 break
             except urllib.error.HTTPError as exc:
-                refresh = exc.code in (401, 403)  # token expired or rotated: fetch a new one
-                retryable = exc.code in RETRY_STATUSES or refresh
                 error = f"HTTP {exc.code} from {self.url}/mfa/query: {exc.read()[:300]!r}"
-            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
-                retryable, error = True, repr(exc)
+                # 401 = token expired or rotated: one fresh token. 403 is IAM, a new token won't help.
+                refresh = exc.code == 401 and not refreshed
+                refreshed = refreshed or refresh
+                retryable = exc.code in RETRY_STATUSES or refresh
+            except urllib.error.URLError as exc:
+                retryable, error = self._never_reached_app(exc), repr(exc)
             except Exception as exc:
                 retryable, error = False, repr(exc)
             if not retryable or attempt > self.retries:

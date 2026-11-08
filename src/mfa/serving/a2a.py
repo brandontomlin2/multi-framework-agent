@@ -24,10 +24,10 @@ from fastapi import FastAPI
 
 from mfa.runtime.graph import (
     _text,
-    dangling_tool_calls,
+    arepair_thread,
+    capped_turn,
     extract_result,
     recursion_limit_for,
-    repair_thread,
     turn_error_text,
 )
 from mfa.spec import CLOUD_RUN, AgentSpec, iteration_limit_error
@@ -97,14 +97,16 @@ class SpecAgentExecutor(AgentExecutor):
                 elif mode == "values":
                     final_messages = data.get("messages") if isinstance(data, dict) else None
         except Exception as exc:
-            error = turn_error_text(exc, self.max_iterations)
-            repair_thread(self.graph, config, error)
+            messages = list((await self.graph.aget_state(config)).values.get("messages", []))
+            error = turn_error_text(exc, self.max_iterations, messages)
+            await arepair_thread(self.graph, config, error)
             await updater.failed(updater.new_agent_message([Part(text=error)]))
             return
-        if dangling_tool_calls(list(final_messages or [])):
+        pending = tuple((await self.graph.aget_state(config)).next or ())
+        if capped_turn(list(final_messages or []), pending, self.max_iterations):
             # Ended on a refused tool call: the iteration cap, reported like /mfa/query does.
             error = iteration_limit_error(self.max_iterations)
-            repair_thread(self.graph, config, error)
+            await arepair_thread(self.graph, config, error)
             await updater.failed(updater.new_agent_message([Part(text=error)]))
             return
 
@@ -112,7 +114,9 @@ class SpecAgentExecutor(AgentExecutor):
             list(final_messages or [])[before:], target=os.environ.get("MFA_TARGET", CLOUD_RUN), user_input=user_input
         ).output
         if final != streamed:
-            await updater.add_artifact([Part(text=final)], artifact_id=artifact_id, name="response", append=False)
+            await updater.add_artifact(
+                [Part(text=final)], artifact_id=artifact_id, name="response", append=False, last_chunk=True
+            )
         await updater.complete()
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
