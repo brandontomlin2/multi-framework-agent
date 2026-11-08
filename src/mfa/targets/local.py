@@ -21,16 +21,13 @@ class LocalRunner:
         self.graph = build_agent_graph(spec, chat_model or make_chat_model(self.model))
 
     def run(self, user_input: str, *, thread_id: str | None = None) -> AgentResult:
-        try:
-            result = run_turn(
-                self.graph,
-                user_input,
-                thread_id=thread_id or uuid.uuid4().hex,
-                target=self.target,
-                recursion_limit=self.spec.max_iterations * 2 + 1,
-            )
-        except Exception as exc:  # surfaced in the eval report rather than aborting the run
-            return AgentResult(target=self.target, input=user_input, output="", error=repr(exc))
+        result = run_turn(
+            self.graph,
+            user_input,
+            thread_id=thread_id or uuid.uuid4().hex,
+            target=self.target,
+            max_iterations=self.spec.max_iterations,
+        )
         result.metadata["model"] = self.model
         return result
 

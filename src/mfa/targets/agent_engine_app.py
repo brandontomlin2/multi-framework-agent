@@ -43,7 +43,7 @@ class LangGraphAgentApp:
             input,
             thread_id=thread_id or uuid.uuid4().hex,
             target=AGENT_ENGINE,
-            recursion_limit=self._spec.max_iterations * 2 + 1,
+            max_iterations=self._spec.max_iterations,
         )
         result.metadata["model"] = self.model
         return result.model_dump()

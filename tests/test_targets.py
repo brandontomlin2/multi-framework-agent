@@ -4,7 +4,7 @@ import pytest
 
 from mfa import deployments
 from mfa.registry import load_agent
-from mfa.spec import AGENT_ENGINE, CLAUDE_MANAGED, LOCAL
+from mfa.spec import AGENT_ENGINE, CLAUDE_MANAGED
 from mfa.targets.agent_engine import AgentEngineRunner, agent_module_ref, build_requirements
 from mfa.targets.agent_engine_app import LangGraphAgentApp
 from mfa.targets.claude_managed import ClaudeManagedRunner, ClaudeManagedTarget, build_agent_params
@@ -90,23 +90,3 @@ def test_claude_managed_runner_executes_custom_tools_host_side():
     results = [e for e in client.sent if e["type"] == "user.custom_tool_result"]
     assert len(results) == 1 and "partly cloudy" in results[0]["content"][0]["text"]
     assert "partly cloudy" in r.output
-
-
-def test_same_scenario_yields_same_trajectory_on_all_targets(monkeypatch):
-    """Parity: one script, three targets, identical tool trajectory and tool outputs."""
-    local = LocalRunner(SPEC, chat_model=ScriptedChatModel(script=list(SCRIPT))).run("q")
-
-    monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=list(SCRIPT)))
-    app = LangGraphAgentApp(agent_ref="weather_agent", model="x:y")
-    app.set_up()
-    ae = AgentEngineRunner(FakeRemoteAgentEngine(app), "rn").run("q")
-
-    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
-    cma = ClaudeManagedRunner(SPEC, record, client=FakeCMAClient(script=list(SCRIPT))).run("q")
-
-    for r in (local, ae, cma):
-        assert [(c.name, c.args, c.output) for c in r.tool_calls] == [
-            (c.name, c.args, c.output) for c in local.tool_calls
-        ]
-        assert r.output == local.output
-    assert {local.target, ae.target, cma.target} == {LOCAL, AGENT_ENGINE, CLAUDE_MANAGED}

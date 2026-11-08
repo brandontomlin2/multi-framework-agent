@@ -67,7 +67,7 @@ If GitHub Actions can't run (for example the account's Actions billing is blocke
 | `cloud_run` | `gcloud` logged in, `GOOGLE_CLOUD_PROJECT`. Optional: `MFA_CLOUD_RUN_REGION` (default `us-central1`), `MFA_CLOUD_RUN_SERVICE_ACCOUNT`, `MFA_CLOUD_RUN_ALLOW_UNAUTHENTICATED=1` (off by default, so callers need an identity token; the runner fetches one) |
 | `agent_engine` | ADC, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` (default `us-central1`), `MFA_STAGING_BUCKET=gs://...`. Optional: `MFA_AGENT_ENGINE_SERVICE_ACCOUNT` |
 | `claude_managed` | `MFA_ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY` (or an `ant auth login` profile). Optional: the `ant` CLI if you use the file-based flow |
-| LLM judge | `MFA_ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY`. Default judge is `claude-opus-5-5` at low effort, override with `MFA_JUDGE_MODEL`. `--no-judge` runs only the deterministic checks |
+| LLM judge | `MFA_ANTHROPIC_API_KEY` or `ANTHROPIC_API_KEY`. Default judge is `claude-opus-5-5` at `medium` effort; override with `MFA_JUDGE_MODEL` / `MFA_JUDGE_EFFORT` or `--judge-model` / `--judge-effort`. `--no-judge` runs only the deterministic checks |
 
 **Anthropic key:** create it at platform.claude.com → Settings → API Keys. `mfa` reads `MFA_ANTHROPIC_API_KEY` first, then `ANTHROPIC_API_KEY`. Use `MFA_ANTHROPIC_API_KEY` wherever other tools also read `ANTHROPIC_API_KEY`, for example in a Claude Code cloud environment, where Claude Code would pick that name up too. In GitHub Actions, store it as the repository secret `ANTHROPIC_API_KEY`.
 
@@ -107,7 +107,7 @@ mfa register weather_agent -t claude_managed --agent-id agent_... --environment-
 mfa eval     weather_agent -t claude_managed
 
 # Everything that's deployed, side by side, gated for CI
-mfa eval    weather_agent -t all --min-pass-rate 0.9   # 'all' = local + every target with a deployment record
+mfa eval    weather_agent -t all --min-pass-rate 0.9 --trials 3   # 'all' = local + every deployed target; 3 runs per case
 mfa compare eval_results/weather_agent/*.json
 
 # Grade any run with Google's tooling as well
@@ -126,6 +126,20 @@ Weather data comes from `MFA_WEATHER_PROVIDER`:
 - `fixture`: deterministic offline data for Seattle, Paris, Tokyo, London and Portland. The tests always use it. For a fully reproducible eval run, set it where the tool runs: in your shell for `local` and `claude_managed`, and with `MFA_FORWARD_ENV=MFA_WEATHER_PROVIDER` at deploy time for the Gemini targets (`MFA_FORWARD_ENV` copies any listed env vars into the deployed container).
 
 Because live weather changes, the eval cases never assert specific temperatures. The deterministic checks cover behaviour (did it ask where, did it call the tool with the right place, did it report temperatures and units), and the judge checks that the reply matches the tool output it saw.
+
+## The turn contract (what every target guarantees)
+
+One eval suite can grade four runtimes only because they agree on what a turn returns. `tests/test_parity.py` runs each scenario below through the real adapter code of every target and asserts identical results.
+
+| Situation | Every target does |
+|---|---|
+| Tool arguments | Validated and coerced against the tool's schema in `ToolSpec.run` (`"2"` → `2`, `"2026-11-08"` → `date`). Invalid arguments become `Error: invalid arguments for <tool>: ...` handed back to the model; the turn goes on. |
+| Tool raises | `Error: tool <tool> failed: <Exception>: ...` handed back to the model; the turn goes on. |
+| Unknown tool name | `Error: unknown tool <name>; available tools: ...` handed back to the model. |
+| More than `max_iterations` tool rounds | The call past the cap is not executed. The turn ends with `AgentResult.error = "Error: iteration limit reached: max_iterations=N"`; the trajectory keeps the executed calls plus the refused one (its `output` is that error). The thread stays usable for the next turn. |
+| Any other failure | `AgentResult.error` is set and the partial trajectory is kept. `/mfa/query` still answers 200; A2A marks the task `failed` with the same text. |
+| Final reply | The last non-empty assistant message of the turn, on `/mfa/query`, A2A and CMA alike. |
+| Transient platform retries | Invisible: the Claude Managed Agents runner ignores `session.error` events the server is retrying (counted in `metadata.server_retries`) and only reports exhausted or terminal errors. |
 
 ## Serving surface (`cloud_run` and `mfa build`)
 
@@ -159,7 +173,9 @@ cases:
       Gives today's weather for Tokyo, Japan, with temperatures that match the tool output.
 ```
 
-- **Passing:** a case passes when every check passes. A skipped judge (`--no-judge`, or no verdict returned) doesn't fail a case.
+- **Passing:** a case passes when no check fails. A judge that is switched off (`--no-judge`) is a skip and doesn't fail a case. A judge that *could not run* (API error, refusal) is recorded as ungraded: it is not a pass, the report counts it under `judge_errors`, and `mfa eval` exits 1 when a gate is set unless you pass `--allow-ungraded`. A case whose runner or grader raises is a failed case with a `harness` check; it never discards the run.
+- **Trials:** `--trials N` runs every case N times. Pass rates then carry a 95% Wilson interval, the table shows `passed/runs` per case, and `mfa compare` says whether two targets' intervals overlap, so one flaky case is not read as a platform difference.
+- **Environment:** every report records the non-secret `MFA_*` variables in effect (for example `MFA_WEATHER_PROVIDER`), so a cross-target difference can be traced to data, not only to the platform.
 - **Reports:** `eval_results/<agent>/<target>-<timestamp>.{json,md}` record per-case checks, per-turn tool trajectories, latency, and CMA session IDs (which you can open in the Console session viewer).
 - **Gemini format:** `mfa export -t gemini_eval` converts any report, from any target, into the Gemini platform `EvaluationDataset` shape (`eval_cases[].agent_data.turns[].events[]`, with `function_call` / `function_response` parts). The rubric and mfa's own checks travel as extra fields for custom metrics.
 
@@ -182,7 +198,8 @@ Bringing an existing LangGraph graph: set `AgentSpec.graph_builder=lambda spec, 
 - **Packaging:** both Gemini targets copy `src/mfa` and `agents/` and pin LangGraph, LangChain and SDK versions to your local install. Run deploys from a repo checkout (`pip install -e .`).
 - **CMA sandbox:** `limited` networking with no allowed hosts, because tools run host-side. The built-in toolset is off so the agent has exactly the spec's tools. `MFA_CMA_ENABLE_TOOLSET=1` adds it, with web tools still off. Any tool call the server pauses for approval during an eval is denied. Environment names are unique per workspace, so a deploy reuses `<agent>-env` if it exists.
 - **CMA turn timeout:** `MFA_CMA_TURN_TIMEOUT_S` (default 600). It is checked as events arrive, and the turn is interrupted when it is exceeded.
-- **Cost:** live evals call real models. A full run is 10 cases per target plus one judge call per case.
+- **Cloud Run runner:** the identity token is refreshed before it expires and transient failures (connection errors, 429, 5xx) are retried with backoff, `MFA_CLOUD_RUN_RETRIES` times (default 3). A 401/403 fetches a fresh token.
+- **Cost:** live evals call real models. A full run is 11 cases per target per trial plus one judge call per case.
 
 ## References
 

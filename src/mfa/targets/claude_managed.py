@@ -7,12 +7,15 @@ graph is not uploaded. Instead the *spec* is translated:
 * each ``ToolSpec``  -> a ``custom`` tool with the same name/description/schema
 * the spec's Claude model -> the agent's ``model``
 
-Custom tools execute in this process (the runner answers each
-``agent.custom_tool_use`` event by calling the same Python function the
-LangGraph targets call), so tool behaviour is identical across all three
-targets. The built-in agent toolset (bash, files, web) is left off by default
-so the agent has exactly the tools the spec declares; set
-``MFA_CMA_ENABLE_TOOLSET=1`` to add it.
+Custom tools execute in this process: the runner answers each
+``agent.custom_tool_use`` event with ``ToolSpec.run`` - the same validation,
+coercion, serialization and error text the LangGraph targets use - so tool
+behaviour is identical across all targets. The runner also enforces the spec's
+``max_iterations`` (Managed Agents has no equivalent of LangGraph's recursion
+limit) and reports the same ``iteration_limit_error`` text when it is hit.
+The built-in agent toolset (bash, files, web) is left off by default so the
+agent has exactly the tools the spec declares; set ``MFA_CMA_ENABLE_TOOLSET=1``
+to add it.
 
 Credentials: ``MFA_ANTHROPIC_API_KEY`` or ``ANTHROPIC_API_KEY`` (or an ``ant auth login`` profile).
 """
@@ -27,7 +30,7 @@ from typing import Any
 
 from mfa import deployments
 from mfa.runtime.result import AgentResult, ToolCall
-from mfa.spec import CLAUDE_MANAGED, AgentSpec
+from mfa.spec import CLAUDE_MANAGED, AgentSpec, ToolResult, iteration_limit_error, unknown_tool_error
 
 DEFAULT_TURN_TIMEOUT_S = float(os.environ.get("MFA_CMA_TURN_TIMEOUT_S", "600"))
 
@@ -91,11 +94,12 @@ class ClaudeManagedRunner:
             self._sessions[thread_id] = session.id
         return self._sessions[thread_id]
 
-    def _tool_result(self, name: str, args: dict[str, Any]) -> tuple[str, bool]:
+    def _tool_result(self, name: str, args: dict[str, Any]) -> ToolResult:
         try:
-            return self.spec.tool_by_name(name).invoke(args), False
-        except Exception as exc:
-            return f"Tool {name} failed: {exc!r}", True
+            tool = self.spec.tool_by_name(name)
+        except KeyError:
+            return ToolResult(unknown_tool_error(name, [t.name for t in self.spec.tools]), True)
+        return tool.run(args)
 
     def run(self, user_input: str, *, thread_id: str | None = None) -> AgentResult:
         thread_id = thread_id or uuid.uuid4().hex
@@ -121,6 +125,9 @@ class ClaudeManagedRunner:
         calls: list[ToolCall] = []
         final_text = ""
         error: str | None = None
+        rounds = 0  # custom tool calls answered this turn
+        server_retries = 0
+        limit_text = iteration_limit_error(self.spec.max_iterations)
 
         # Stream-first: open the stream, then send, so no early events are missed.
         with sessions.events.stream(session_id=session_id) as stream:
@@ -139,8 +146,18 @@ class ClaudeManagedRunner:
                     if text:
                         final_text = text  # last message of the turn, same rule as LangGraph
                 elif event.type == "agent.custom_tool_use":
-                    output, is_error = self._tool_result(event.name, dict(event.input or {}))
-                    calls.append(ToolCall(name=event.name, args=dict(event.input or {}), output=output))
+                    args = dict(event.input or {})
+                    rounds += 1
+                    if rounds > self.spec.max_iterations:
+                        # Same cap as the LangGraph graph: the call past the limit is not
+                        # executed and the turn is stopped; the trajectory records the
+                        # refused call with the limit error as its output.
+                        calls.append(ToolCall(name=event.name, args=args, output=limit_text))
+                        error = limit_text
+                        sessions.events.send(session_id=session_id, events=[{"type": "user.interrupt"}])
+                        continue
+                    output, is_error = self._tool_result(event.name, args)
+                    calls.append(ToolCall(name=event.name, args=args, output=output))
                     sessions.events.send(
                         session_id=session_id,
                         events=[
@@ -162,17 +179,30 @@ class ClaudeManagedRunner:
                             events=[{"type": "user.tool_confirmation", "tool_use_id": event.id, "result": "deny"}],
                         )
                 elif event.type == "session.error":
-                    error = str(getattr(event, "error", event))
+                    err = getattr(event, "error", None)
+                    retry = getattr(getattr(err, "retry_status", None), "type", None)
+                    if retry == "retrying":
+                        # The server retries on its own; the LangGraph targets' SDK retries
+                        # are just as invisible, so this is not a failure of the turn.
+                        server_retries += 1
+                        continue
+                    kind = getattr(err, "type", "error")
+                    message = getattr(err, "message", None) or str(err if err is not None else event)
+                    error = error or f"{kind}: {message}"
                 elif event.type == "session.status_idle":
-                    if event.stop_reason.type != "requires_action":
-                        if event.stop_reason.type != "end_turn":
-                            error = error or f"session stopped: {event.stop_reason.type}"
+                    reason = event.stop_reason.type
+                    if reason != "requires_action":
+                        if reason != "end_turn":
+                            error = error or f"session stopped: {reason}"
                         break
                 elif event.type == "session.status_terminated":
                     error = error or "session terminated"
                     break
 
-        return AgentResult(target=self.target, input=user_input, output=final_text, tool_calls=calls, error=error)
+        result = AgentResult(target=self.target, input=user_input, output=final_text, tool_calls=calls, error=error)
+        if server_retries:
+            result.metadata["server_retries"] = server_retries
+        return result
 
 
 def environment_params(spec: AgentSpec) -> dict[str, Any]:

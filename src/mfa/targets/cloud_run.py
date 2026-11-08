@@ -17,6 +17,7 @@ import os
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -49,30 +50,70 @@ def _identity_token(audience: str) -> str | None:
         return None
 
 
+TOKEN_TTL_S = 50 * 60  # Google ID tokens live 60 minutes; refresh well before that
+RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+
+
 class CloudRunRunner:
+    """Calls ``POST /mfa/query`` on the deployed service.
+
+    The identity token is refreshed before it expires (long eval runs used to
+    fail wholesale after an hour) and transient failures - connection errors,
+    429 and 5xx - are retried with backoff so platform hiccups are not graded
+    as agent failures.
+    """
+
     target = CLOUD_RUN
 
-    def __init__(self, url: str, timeout_s: float = 600):
+    def __init__(self, url: str, timeout_s: float = 600, retries: int | None = None):
         self.url = url.rstrip("/")
         self.timeout_s = timeout_s
-        self._token = _identity_token(self.url)
+        self.retries = int(os.environ.get("MFA_CLOUD_RUN_RETRIES", "3")) if retries is None else retries
+        self._token: str | None = None
+        self._token_at = 0.0
+
+    def _bearer(self, *, refresh: bool = False) -> str | None:
+        if refresh or self._token is None or time.monotonic() - self._token_at > TOKEN_TTL_S:
+            self._token = _identity_token(self.url)
+            self._token_at = time.monotonic()
+        return self._token
+
+    def _post_once(self, body: bytes, *, refresh_token: bool) -> dict[str, Any]:
+        req = urllib.request.Request(f"{self.url}/mfa/query", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        if token := self._bearer(refresh=refresh_token):
+            req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            return json.loads(resp.read())
 
     def run(self, user_input: str, *, thread_id: str | None = None) -> AgentResult:
         start = time.monotonic()
         body = json.dumps({"input": user_input, "thread_id": thread_id}).encode()
-        req = urllib.request.Request(f"{self.url}/mfa/query", data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
-        if self._token:
-            req.add_header("Authorization", f"Bearer {self._token}")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                payload = json.loads(resp.read())
-        except Exception as exc:
-            return AgentResult(target=self.target, input=user_input, output="", error=repr(exc))
+        attempt = 0
+        refresh = False
+        while True:
+            attempt += 1
+            try:
+                payload = self._post_once(body, refresh_token=refresh)
+                break
+            except urllib.error.HTTPError as exc:
+                refresh = exc.code in (401, 403)  # token expired or rotated: fetch a new one
+                retryable = exc.code in RETRY_STATUSES or refresh
+                error = f"HTTP {exc.code} from {self.url}/mfa/query: {exc.read()[:300]!r}"
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+                retryable, error = True, repr(exc)
+            except Exception as exc:
+                retryable, error = False, repr(exc)
+            if not retryable or attempt > self.retries:
+                r = AgentResult(target=self.target, input=user_input, output="", error=error)
+                r.metadata.update({"url": self.url, "attempts": attempt})
+                return r
+            time.sleep(min(8.0, 0.5 * 2 ** (attempt - 1)))
         result = AgentResult.model_validate(payload)
         result.metadata["server_latency_s"] = result.latency_s
         result.latency_s = round(time.monotonic() - start, 3)
         result.metadata["url"] = self.url
+        result.metadata["attempts"] = attempt
         return result
 
 

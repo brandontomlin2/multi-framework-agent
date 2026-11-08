@@ -5,7 +5,7 @@ Targets: local | agent_engine (Agent Runtime) | cloud_run (container, A2A) | cla
     mfa deploy   weather_agent --target claude_managed
     mfa run      weather_agent --target local "What's the weather in Paris today?"
     mfa chat     weather_agent --target agent_engine
-    mfa eval     weather_agent --target all --min-pass-rate 0.9
+    mfa eval     weather_agent --target all --min-pass-rate 0.9 --trials 3
     mfa compare  eval_results/weather_agent/*.json
     mfa show     weather_agent --target claude_managed      # print the translated config
     mfa build    weather_agent -o build/weather_agent        # container context (docker / agents-cli)
@@ -92,9 +92,10 @@ def cmd_eval(args) -> int:
         print(f"Agent {spec.name} has no eval_dataset; pass --dataset", file=sys.stderr)
         return 2
     cases = load_cases(dataset, tags=args.tag, ids=args.case)
-    judge = None if args.no_judge else claude_judge(args.judge_model)
+    judge = None if args.no_judge else claude_judge(args.judge_model, args.judge_effort)
 
     worst = 1.0
+    ungraded = 0
     paths = []
     for t in _targets(args.target, spec.name):
         runner = _runner(spec, t, args)
@@ -105,21 +106,30 @@ def cmd_eval(args) -> int:
             judge=judge,
             concurrency=args.concurrency,
             model=getattr(runner, "model", None) or _record_model(spec.name, t),
+            trials=args.trials,
         )
         json_path, md_path = save_report(report, args.out)
         paths.append(json_path)
         print(to_markdown(report))
         print(f"saved {json_path} and {md_path}\n")
         worst = min(worst, report.pass_rate)
+        s = report.summary()
+        ungraded += s["judge_errors"] + s["harness_errors"]
 
     if len(paths) > 1:
         from mfa.evals import compare
 
         print(compare(paths))
+    failed = False
     if args.min_pass_rate is not None and worst < args.min_pass_rate:
         print(f"FAIL: pass rate {worst:.0%} < required {args.min_pass_rate:.0%}", file=sys.stderr)
-        return 1
-    return 0
+        failed = True
+    if ungraded and not args.allow_ungraded:
+        # A verdict with ungraded checks is not a verdict; never let the gate pass on it.
+        print(f"FAIL: {ungraded} check(s) could not be graded (judge or harness errors); "
+              "re-run, or pass --allow-ungraded to report them without failing", file=sys.stderr)
+        failed = True
+    return 1 if failed else 0
 
 
 def _record_model(agent: str, target: str) -> str | None:
@@ -249,9 +259,13 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--case", action="append", help="only this case id (repeatable)")
     e.add_argument("--no-judge", action="store_true", help="skip LLM-as-judge checks")
     e.add_argument("--judge-model")
+    e.add_argument("--judge-effort", help="low | medium | high (default MFA_JUDGE_EFFORT or medium)")
     e.add_argument("--concurrency", type=int, default=4)
     e.add_argument("--out", default="eval_results")
     e.add_argument("--min-pass-rate", type=float, help="exit 1 if any target scores below this (0-1)")
+    e.add_argument("--trials", type=int, default=1, help="run every case this many times (pass rate gets a 95%% CI)")
+    e.add_argument("--allow-ungraded", action="store_true",
+                   help="do not exit 1 when judge/harness errors leave checks ungraded")
     e.add_argument("--url", help="cloud_run: evaluate this URL instead of the deployed one")
     e.set_defaults(func=cmd_eval)
 

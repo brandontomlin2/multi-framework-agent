@@ -63,19 +63,19 @@ def test_harness_multi_turn_judge_and_reports(tmp_path):
     })
     judged = []
 
-    def judge(case, result):
-        judged.append(case.id)
+    def judge(case, result, turns):
+        judged.append((case.id, len(turns)))
         return Check(name="judge", passed=result.output == "hello")
 
     report = run_eval(agent="demo", runner=runner, cases=cases, judge=judge, concurrency=1)
     assert report.pass_rate == 1.0
-    assert judged == ["one"]
+    assert judged == [("one", 1)]
     assert runner.threads[1] == runner.threads[2]  # both turns of case "two" share a thread
     assert report.summary()["judge_pass_rate"] == 1.0
 
     json_path, md_path = save_report(report, tmp_path)
     assert json.loads(json_path.read_text())["summary"]["passed"] == 2
-    assert "2/2 cases passed" in md_path.read_text()
+    assert "2/2 passed" in md_path.read_text()
 
     other = run_eval(agent="demo", runner=CannedRunner("claude_managed", {}), cases=cases, judge=None)
     assert other.pass_rate == 0.0
@@ -90,3 +90,58 @@ def test_judge_skipped_when_disabled_does_not_fail_case():
     report = run_eval(agent="d", runner=CannedRunner("local", {"q": ("ok", [])}), cases=[case], judge=None)
     assert report.cases[0].passed
     assert report.cases[0].checks[-1].passed is None
+
+
+def test_judge_errors_are_not_passes_and_are_counted():
+    case = EvalCase(id="j", input="q", judge="anything")
+    errored = Check(name="judge", passed=None, error=True, detail="judge error: 429")
+    report = run_eval(agent="d", runner=CannedRunner("local", {"q": ("ok", [])}), cases=[case],
+                      judge=lambda c, r, t: errored)
+    s = report.summary()
+    assert report.cases[0].passed  # no check failed...
+    assert s["judge_errors"] == 1 and s["judge_pass_rate"] is None  # ...but nothing was judged either
+    assert "could not be graded" in to_markdown(report)
+
+
+def test_one_crashing_case_does_not_discard_the_run():
+    class Flaky(CannedRunner):
+        def run(self, user_input, *, thread_id=None):
+            if user_input == "crash":
+                raise RuntimeError("runner bug")
+            return super().run(user_input, thread_id=thread_id)
+
+    cases = [EvalCase(id="ok", input="q"), EvalCase(id="bad", input="crash")]
+    report = run_eval(agent="d", runner=Flaky("local", {"q": ("fine", [])}), cases=cases, judge=None)
+    by_id = {c.case_id: c for c in report.cases}
+    assert by_id["ok"].passed and not by_id["bad"].passed
+    assert by_id["bad"].checks[0].name == "harness" and "runner bug" in by_id["bad"].checks[0].detail
+    assert report.summary()["harness_errors"] == 1
+
+
+def test_trials_give_per_case_counts_and_an_interval(tmp_path):
+    class Alternating(CannedRunner):
+        def __init__(self):
+            super().__init__("local", {})
+            self.n = 0
+
+        def run(self, user_input, *, thread_id=None):
+            self.n += 1
+            return AgentResult(target=self.target, input=user_input, output="yes" if self.n % 2 else "no")
+
+    case = EvalCase(id="flip", input="q", expect={"output_contains": ["yes"]})
+    report = run_eval(agent="d", runner=Alternating(), cases=[case], judge=None, trials=4, concurrency=1)
+    s = report.summary()
+    assert s["runs"] == 4 and s["trials"] == 4 and s["pass_rate"] == 0.5
+    lo, hi = s["pass_rate_ci95"]
+    assert lo < 0.5 < hi
+    assert "| flip | 2/4 |" in to_markdown(report)
+    p, _ = save_report(report, tmp_path)
+    assert "2/4" in compare([p]) and "within sampling noise" in compare([p, p])
+
+
+def test_report_records_non_secret_environment(monkeypatch):
+    monkeypatch.setenv("MFA_WEATHER_PROVIDER", "fixture")
+    monkeypatch.setenv("MFA_ANTHROPIC_API_KEY", "sk-secret")
+    report = run_eval(agent="d", runner=CannedRunner("local", {}), cases=[EvalCase(id="e", input="q")], judge=None)
+    assert report.environment["MFA_WEATHER_PROVIDER"] == "fixture"
+    assert "MFA_ANTHROPIC_API_KEY" not in report.environment

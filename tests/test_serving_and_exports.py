@@ -191,9 +191,76 @@ def test_a2a_route_applies_spec_iteration_limit(monkeypatch):
         }).json()
     finally:
         load_root_agent.cache_clear()
-    assert "error" in resp and "Recursion limit of 5" in resp["error"]["message"]
+    task = resp["result"]
+    assert task["status"]["state"] == "failed"
+    assert task["status"]["message"]["parts"][0]["text"] == "Error: iteration limit reached: max_iterations=2"
+
+
+def test_a2a_reply_is_the_final_message_like_mfa_query(monkeypatch):
+    """Intermediate assistant text ("let me check") is replaced by the final reply, as the evals see it."""
+    from mfa.serving import load_root_agent
+
+    load_root_agent.cache_clear()
+    monkeypatch.setenv("MFA_MODEL", "x:y")
+    script = [{"text": "Let me check.", "tool": "get_weather_today", "args": {"location": "Paris"}}, {"text": "Sunny in Paris."}] * 2
+    monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=script))
+    from mfa.serving.fast_api_app import create_app
+
+    try:
+        c = TestClient(create_app())
+        a2a = c.post("/a2a/app", json={
+            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "params": {"message": {"kind": "message", "messageId": "m1", "role": "user",
+                                   "parts": [{"kind": "text", "text": "weather in Paris?"}]}},
+        }).json()["result"]
+        query = c.post("/mfa/query", json={"input": "weather in Paris?"}).json()
+    finally:
+        load_root_agent.cache_clear()
+    texts = ["".join(p["text"] for p in a["parts"]) for a in a2a["artifacts"]]
+    assert texts == ["Sunny in Paris."] and query["output"] == "Sunny in Paris."
 
 
 def test_forwarded_env_lists_only_named_vars(monkeypatch):
     monkeypatch.setenv("MFA_FORWARD_ENV", "MFA_WEATHER_PROVIDER, MISSING_VAR")
     assert deployments.forwarded_env() == {"MFA_WEATHER_PROVIDER": "fixture"}
+
+
+def test_cloud_run_runner_retries_transient_errors_and_refreshes_token(monkeypatch):
+    import urllib.error
+
+    attempts = []
+    import itertools
+
+    tokens = (f"tok-{i}" for i in itertools.count(1))
+    monkeypatch.setattr("mfa.targets.cloud_run._identity_token", lambda aud: next(tokens))
+    monkeypatch.setattr("mfa.targets.cloud_run.time.sleep", lambda s: None)
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"target": "cloud_run", "input": "q", "output": "ok", "latency_s": 0.1}).encode()
+
+    def flaky_urlopen(req, timeout):
+        attempts.append(req.get_header("Authorization"))
+        if len(attempts) == 1:
+            raise urllib.error.HTTPError(req.full_url, 503, "unavailable", {}, None)
+        if len(attempts) == 2:
+            raise urllib.error.HTTPError(req.full_url, 401, "expired", {}, None)
+        return _Resp()
+
+    monkeypatch.setattr("urllib.request.urlopen", flaky_urlopen)
+    r = CloudRunRunner("http://svc").run("q")
+    assert r.error is None and r.output == "ok" and r.metadata["attempts"] == 3
+    assert attempts == ["Bearer tok-1", "Bearer tok-1", "Bearer tok-2"]  # 401 forced a fresh token
+
+    def always_500(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", always_500)
+    r = CloudRunRunner("http://svc", retries=1).run("q")
+    assert r.error.startswith("HTTP 500") and r.metadata["attempts"] == 2
