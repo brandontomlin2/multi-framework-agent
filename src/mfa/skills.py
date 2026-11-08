@@ -35,8 +35,9 @@ from mfa.spec import AgentSpec, SkillSpec, ToolSpec
 DEFAULT_SKILLS_ROOT = "/workspace/skills"
 MAX_OUTPUT_CHARS = 100_000  # Managed Agents offloads larger outputs to a file; we truncate
 _INTERPRETERS = {"python", "python3", "sh", "bash", "node"}
-_SHELL_META = re.compile(r"[|;&<>$`\\]")
-_SECRET_NAME = re.compile(r"KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL", re.IGNORECASE)
+# Anything bash itself would interpret: operators, expansions, quotes-that-hide-things, comments,
+# and line breaks (a second line is a second command on the server's real shell).
+_SHELL_META = re.compile(r"[|;&<>$`\\#*?\[\]{}~!\r\n]")
 _SKILL_MD_PATH = re.compile(r"(?:^|/)(?P<skill>[a-z0-9]+(?:-[a-z0-9]+)*)/SKILL\.md$")
 
 
@@ -79,66 +80,91 @@ class SkillSandbox:
     def location(self, sk: SkillSpec) -> str:
         return f"{self.root}/{sk.name}"
 
-    def announce(self, real: Path) -> str:
-        """The virtual path of a real file inside a skill folder."""
+    def announce(self, real: Path) -> str | None:
+        """The virtual path of a real file inside a skill folder, or None when it is outside them."""
         for sk in self.local.values():
             try:
                 rel = real.resolve().relative_to(sk.path.resolve())
             except ValueError:
                 continue
             return f"{self.location(sk)}/{rel.as_posix()}".rstrip("/")
-        raise PermissionError(f"{real} is not inside a skill folder")
+        return None
 
     def resolve(self, p: str) -> Path:
         """Map a model-supplied path to a real path inside a skill folder, or raise.
 
-        Accepted forms: ``<root>/<skill>/...``, ``skills/<skill>/...`` and ``<skill>/...``.
+        Root-agnostic: the path may start with any root (``/workspace/skills``, the
+        root a Managed Agents sandbox announces, ``skills/`` or nothing) as long as
+        it then names one of this agent's skills followed by a path inside it.
         """
         text = str(p).strip()
-        if not text:
-            raise PermissionError(f"empty path is not inside a skill folder ({self.root}/<skill>/...)")
-        rel = text
-        if rel == self.root or rel.startswith(self.root + "/"):
-            rel = rel[len(self.root):].lstrip("/")
-        elif rel.startswith("skills/"):
-            rel = rel[len("skills/"):]
-        parts = [part for part in rel.split("/") if part not in ("", ".")]
-        if not parts or parts[0] not in self.local:
+        parts = [part for part in text.split("/") if part not in ("", ".")]
+        idx = next((i for i, part in enumerate(parts) if part in self.local), None)
+        if idx is None:
             raise PermissionError(f"{text} is not inside a skill folder ({self.root}/<skill>/...)")
-        folder = self.local[parts[0]].path.resolve()
-        real = (folder.joinpath(*parts[1:])).resolve()
+        folder = self.local[parts[idx]].path.resolve()
+        real = folder.joinpath(*parts[idx + 1:]).resolve()
         if real != folder and not real.is_relative_to(folder):
             raise PermissionError(f"{text} is not inside a skill folder ({self.root}/<skill>/...)")
         return real
 
     def check_bash(self, command: str | None) -> tuple[list[str], Path]:
-        """Validate a bash command: an interpreter (or the script itself) plus a file under a skill's scripts/."""
+        """Validate a bash command: a bare interpreter name (or the script itself) plus a file under a skill's scripts/.
+
+        The string is what the Managed Agents server will run in a real shell, so
+        anything bash would interpret (operators, expansions, comments, a second
+        line) is refused rather than normalised away.
+        """
         if not self.allow_scripts:
             raise PermissionError("running scripts is not enabled for this agent (allow_skill_scripts)")
         if not command or not command.strip():
             raise PermissionError("no command given")
-        if _SHELL_META.search(command):
+        if _SHELL_META.search(command) or command.strip() != command.strip("\t "):
             raise PermissionError(f"only a skill's own scripts/ may be run, without shell operators: {command}")
         argv = shlex.split(command)
-        script_index = 1 if argv and Path(argv[0]).name in _INTERPRETERS else 0
+        if any(ch in tok for tok in argv for ch in "'\""):
+            raise PermissionError(f"only a skill's own scripts/ may be run, without shell operators: {command}")
+        script_index = 1 if argv and argv[0] in _INTERPRETERS else 0
         if len(argv) <= script_index:
             raise PermissionError(f"only a skill's own scripts/ may be run: {command}")
         script = self.resolve(argv[script_index])
         folder = next(sk.path.resolve() for sk in self.local.values() if script.is_relative_to(sk.path.resolve()))
         if not script.is_file() or script.parent != folder / "scripts":
             raise PermissionError(f"only a skill's own scripts/ may be run: {command}")
-        if script_index == 1:
-            argv[0] = Path(argv[0]).name
         argv[script_index] = str(script)
         return argv, folder
 
+    def search_root(self, pattern: str | None, path: str | None) -> Path:
+        """The one skill directory a glob/grep call may search: ``path`` inside a skill folder, or an absolute
+        pattern under a skill's location. A call with neither is refused on every target, because the
+        Managed Agents server would otherwise search its whole working directory."""
+        if path:
+            real = self.resolve(path)
+            if not real.is_dir():
+                raise NotADirectoryError(f"{path} is not a directory in a skill folder")
+            return real
+        if pattern and "/" in pattern.strip():
+            head, _, _ = pattern.strip().rpartition("/")
+            try:
+                real = self.resolve(head)
+                if real.is_dir():
+                    return real
+            except PermissionError:
+                pass
+        raise PermissionError(f"glob and grep need a path inside a skill folder, e.g. {self.root}/<skill>")
+
     def authorize(self, name: str, args: dict[str, Any]) -> None:
-        """Raise if a built-in tool call falls outside the sandbox; the Managed Agents runner denies it then."""
+        """Raise if a built-in tool call falls outside the sandbox; the Managed Agents runner denies it then.
+
+        Mirrors exactly what ``read``/``glob``/``grep``/``bash`` accept, so a call
+        approved here is one the LangGraph targets would have run.
+        """
         if name == "read":
             self.resolve(str(args.get("file_path", "")))
         elif name in ("glob", "grep"):
-            if args.get("path"):
-                self.resolve(str(args["path"]))
+            self.search_root(str(args.get("pattern", "")), args.get("path"))
+            if ".." in str(args.get("pattern", "")).split("/"):
+                raise PermissionError("pattern may not contain '..'")
         elif name == "bash":
             if args.get("restart") and not args.get("command"):
                 return
@@ -162,45 +188,38 @@ class SkillSandbox:
             text = "".join(lines[start - 1:end])
         return _truncate(text)
 
-    def _search_roots(self, path: str | None) -> list[Path]:
-        if path:
-            real = self.resolve(path)
-            if not real.is_dir():
-                raise NotADirectoryError(f"{path} is not a directory in a skill folder")
-            return [real]
-        return [sk.path.resolve() for sk in self.local.values()]
+    def _files_under(self, base: Path, pattern: str):
+        if ".." in pattern.split("/"):
+            raise PermissionError("pattern may not contain '..'")
+        for p in sorted(base.glob(pattern or "*")):
+            if not p.is_file() or any(part in ("__pycache__", "node_modules") for part in p.parts):
+                continue
+            if not p.resolve().is_relative_to(base):
+                continue  # a symlink pointing outside the skill folder is skipped, never followed
+            yield p
 
     def glob(self, pattern: str, path: str | None = None) -> str:
+        base = self.search_root(pattern, path)
         pat = pattern.strip()
-        if pat.startswith(self.root + "/") and path is None:
-            # an absolute pattern under the virtual root: search inside that skill
-            rest = pat[len(self.root) + 1:]
-            name, _, pat = rest.partition("/")
-            if name in self.local:
-                path, pat = f"{self.root}/{name}", pat or "*"
-        hits: list[str] = []
-        for base in self._search_roots(path):
-            for p in sorted(base.glob(pat.lstrip("/") or "*")):
-                if p.is_file() and not any(part in ("__pycache__", "node_modules") for part in p.parts):
-                    hits.append(self.announce(p))
-        return _truncate("\n".join(sorted(set(hits))) or "(no files match)")
+        if path is None:
+            pat = pat.rpartition("/")[2] or "*"  # the directory part chose the root
+        hits = [self.announce(p) for p in self._files_under(base, pat)]
+        return _truncate("\n".join(sorted(h for h in hits if h)) or "(no files match)")
 
     def grep(self, pattern: str, path: str | None = None) -> str:
+        base = self.search_root(None, path) if path else self.search_root(pattern, None)
         rx = re.compile(pattern)
         hits: list[str] = []
-        for base in self._search_roots(path):
-            for p in sorted(base.rglob("*")):
-                if not p.is_file() or any(part in ("__pycache__", "node_modules") for part in p.parts):
-                    continue
-                try:
-                    lines = p.read_text(encoding="utf-8").splitlines()
-                except (UnicodeDecodeError, OSError):
-                    continue
-                for i, line in enumerate(lines, 1):
-                    if rx.search(line):
-                        hits.append(f"{self.announce(p)}:{i}:{line}")
-                        if len(hits) >= 200:
-                            return _truncate("\n".join(hits) + "\n[more matches omitted]")
+        for p in self._files_under(base, "**/*"):
+            try:
+                lines = p.read_text(encoding="utf-8").splitlines()
+            except (UnicodeDecodeError, OSError):
+                continue
+            for i, line in enumerate(lines, 1):
+                if rx.search(line):
+                    hits.append(f"{self.announce(p)}:{i}:{line}")
+                    if len(hits) >= 200:
+                        return _truncate("\n".join(hits) + "\n[more matches omitted]")
         return _truncate("\n".join(hits) or "(no matches)")
 
     def bash(self, command: str | None = None, restart: bool | None = None, timeout_ms: int | None = None) -> str:
@@ -245,20 +264,20 @@ def skill_tools(spec: AgentSpec, sandbox: SkillSandbox | None = None) -> list[To
         return sb.read(file_path, view_range)
 
     def glob(pattern: str, path: str | None = None) -> str:
-        """List files in the skill folders matching a glob pattern (``**`` matches directories), one path per line.
+        """List files in a skill folder matching a glob pattern (``**`` matches directories), one path per line.
 
         Args:
-            pattern: Glob pattern such as "**/*.md".
-            path: Optional directory inside a skill folder to search under; defaults to every skill folder.
+            pattern: Glob pattern such as "**/*.md", relative to path.
+            path: The skill directory to search under (a skill's location or a folder inside it). Required.
         """
         return sb.glob(pattern, path)
 
     def grep(pattern: str, path: str | None = None) -> str:
-        """Search skill files for a regular expression; returns "path:line_number:line" for each match.
+        """Search a skill folder's files for a regular expression; returns "path:line_number:line" for each match.
 
         Args:
             pattern: Regular expression to search for.
-            path: Optional directory inside a skill folder to search under; defaults to every skill folder.
+            path: The skill directory to search under (a skill's location or a folder inside it). Required.
         """
         return sb.grep(pattern, path)
 
@@ -288,8 +307,8 @@ def skills_prompt_block(spec: AgentSpec, sandbox: SkillSandbox | None = None) ->
         "name, description and location are listed here. When a task matches a skill's description, first call "
         "`read` on that skill's SKILL.md (for example {\"file_path\": \"<location>/SKILL.md\"}), then follow its "
         "instructions, reading the files it references (paths are relative to the skill's folder) with `read`, "
-        "and finding files with `glob` or `grep` when needed. Skill folders are read-only. Do not read a skill "
-        "whose description does not match the task.",
+        "and finding files with `glob` or `grep` when needed, always passing the skill's location as `path`. "
+        "Skill folders are read-only. Do not read a skill whose description does not match the task.",
         "",
     ]
     for sk in sb.skills:

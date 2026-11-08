@@ -25,10 +25,12 @@ ROOT = f"{DEFAULT_SKILLS_ROOT}/parity-skill"
 def test_paths_resolve_only_inside_skill_folders():
     sb = SkillSandbox.for_spec(SPEC)
     real = (SKILLS / "parity-skill" / "SKILL.md").resolve()
-    for form in (f"{ROOT}/SKILL.md", "skills/parity-skill/SKILL.md", "parity-skill/SKILL.md", f"{ROOT}/./SKILL.md"):
-        assert sb.resolve(form) == real, form
+    for form in (f"{ROOT}/SKILL.md", "skills/parity-skill/SKILL.md", "parity-skill/SKILL.md", f"{ROOT}/./SKILL.md",
+                 "/mnt/skills/custom/parity-skill/SKILL.md", "/workspace/skillsx/parity-skill/SKILL.md"):
+        assert sb.resolve(form) == real, form  # any root the server announces, as long as the skill name follows
     assert sb.announce(real) == f"{ROOT}/SKILL.md"
-    for bad in ("/etc/passwd", f"{ROOT}/../../etc/passwd", "other-skill/SKILL.md", "", "/workspace/skillsx/parity-skill/SKILL.md"):
+    assert sb.announce(Path("/etc/passwd")) is None
+    for bad in ("/etc/passwd", f"{ROOT}/../../etc/passwd", "other-skill/SKILL.md", "", "/workspace/skills"):
         with pytest.raises(PermissionError):
             sb.resolve(bad)
     with pytest.raises(FileNotFoundError):
@@ -41,14 +43,27 @@ def test_read_glob_grep_and_truncation(tmp_path, monkeypatch):
     sb = SkillSandbox.for_spec(SPEC)
     assert sb.read(f"{ROOT}/references/notes.md", [2, 0]) == "line two\nline three\n"
     assert sb.read(f"{ROOT}/references/notes.md", [1, 1]) == "line one\n"
-    assert sb.glob("*.md") == f"{ROOT}/SKILL.md"
+    assert sb.glob("*.md", path=ROOT) == f"{ROOT}/SKILL.md"
     assert sb.glob("*", path=f"{ROOT}/references") == f"{ROOT}/references/notes.md"
-    assert sb.glob(f"{ROOT}/references/*.md") == f"{ROOT}/references/notes.md"  # absolute pattern under the root
-    assert sb.glob("*.zzz") == "(no files match)"
+    assert sb.glob(f"{ROOT}/references/*.md") == f"{ROOT}/references/notes.md"  # absolute pattern under a skill
+    assert sb.glob("*.zzz", path=ROOT) == "(no files match)"
     assert sb.grep("line t", path=f"{ROOT}/references") == f"{ROOT}/references/notes.md:2:line two\n{ROOT}/references/notes.md:3:line three"
-    assert sb.grep("nothing-here") == "(no matches)"
+    assert sb.grep("nothing-here", path=ROOT) == "(no matches)"
+    for call in (lambda: sb.glob("*"), lambda: sb.grep("x"), lambda: sb.glob("*", path="/etc"),
+                 lambda: sb.glob("../*", path=ROOT), lambda: sb.glob("../../*.py", path=ROOT)):
+        with pytest.raises(PermissionError):
+            call()  # no skill path, a path outside, or a pattern that walks out
+    # a symlink to a file outside the skill folder is skipped, not followed, and never named
+    link_dir = tmp_path / "linked-skill"
+    link_dir.mkdir()
+    (link_dir / "SKILL.md").write_text("---\nname: linked-skill\ndescription: links\n---\nx")
+    (tmp_path / "secret.txt").write_text("hunter2")
+    (link_dir / "leak.txt").symlink_to(tmp_path / "secret.txt")
+    linked = SkillSandbox.for_spec(AgentSpec(name="l", description="d", system_prompt="p", tools=[], skills=local_skills(tmp_path)))
+    assert linked.glob("*", path="/workspace/skills/linked-skill") == "/workspace/skills/linked-skill/SKILL.md"
+    assert "hunter2" not in linked.grep("hunter", path="/workspace/skills/linked-skill")
     with pytest.raises(PermissionError):
-        sb.glob("*", path="/etc")
+        linked.read("/workspace/skills/linked-skill/leak.txt")
     # a very large file is truncated the way the server offloads it
     monkeypatch.setenv("MFA_SKILLS_ROOT", "/srv/skills")
     big = tmp_path / "big-skill"
@@ -68,9 +83,12 @@ def test_bash_is_an_allowlist_of_skill_scripts():
     assert argv[0] == "python3" and argv[1].endswith("tests/skills/parity-skill/scripts/hello.py") and argv[2:] == ["--flag", "1"]
     assert folder == (SKILLS / "parity-skill").resolve()
     assert sb.bash(f"python3 {ROOT}/scripts/hello.py") == "hello from parity-skill\n"
+    assert sb.bash(f"python3 /mnt/skills/custom/parity-skill/scripts/hello.py there") == "hello from parity-skill there\n"
     assert sb.bash(restart=True) == "bash session restarted"
     for bad in (f"python3 {ROOT}/SKILL.md", f"python3 {ROOT}/scripts/missing.py", "ls", "python3", f"python3 {ROOT}/scripts/hello.py; rm -rf /",
-                f"python3 {ROOT}/scripts/hello.py > out", "/bin/sh -c id", ""):
+                f"python3 {ROOT}/scripts/hello.py > out", "/bin/sh -c id", "", f"/usr/bin/python3 {ROOT}/scripts/hello.py",
+                f"python3 {ROOT}/scripts/hello.py\nid", f"python3 {ROOT}/scripts/hello.py # c", f"python3 {ROOT}/scripts/hello.py '$(id)'",
+                f"python3 {ROOT}/scripts/hello.py ~ *", f"python3 {ROOT}/scripts/hello.py $(id)"):
         with pytest.raises(PermissionError):
             sb.check_bash(bad)
     sb.authorize("bash", {"restart": True})

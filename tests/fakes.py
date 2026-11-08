@@ -95,7 +95,10 @@ class FakeCMAClient:
     """
 
     def __init__(self, script: list[dict[str, Any]] | None = None, *, spec: Any | None = None,
-                 builtin_enabled: set[str] | None = None):
+                 builtin_enabled: set[str] | None = None, builtin_permission: str | None = "ask"):
+        # builtin_permission: "ask" (always_ask: pause for a confirmation), "allow" (the server runs the
+        # call at once), or None (an event without evaluated_permission that the server still blocks on).
+        self.builtin_permission = builtin_permission
         self.script = list(script or [])
         self.sent: list[dict[str, Any]] = []
         self.batches: list[list[dict[str, Any]]] = []  # each events=[...] request as sent
@@ -195,9 +198,15 @@ class FakeCMAClient:
         if e["result"] == "deny":
             text, is_error = e.get("deny_message") or f"Permission to use {name} has been denied.", True
         else:
-            # The server runs the built-in tool in the sandbox; here the same ToolSpec the graph binds runs it.
-            text, is_error = self._builtin_tools[name].run(args)
+            text, is_error = self._execute_builtin(name, args)
         self._pending.append(_tool_result(tool_use_id, text, is_error))
+
+    def _execute_builtin(self, name, args):
+        """What the server does with an approved built-in call: run it in the sandbox and render the result
+        its own way. The same files are read, but the rendering deliberately differs from the LangGraph
+        tools (numbered lines, reverse order, a prefix on errors) so a test cannot mistake the two."""
+        text, is_error = self._builtin_tools[name].run(args)
+        return _server_render(name, text, is_error), is_error
 
     def _advance(self):
         if not self.script:
@@ -238,11 +247,21 @@ class FakeCMAClient:
                             evaluated_permission="deny", evaluation=None))
                         self._pending.append(_tool_result(ev_id, f"Permission to use {c['tool']} has been denied.", True))
                         continue
+                    if self.builtin_permission == "allow":
+                        # auto / always_allow: the server runs it immediately, no pause.
+                        self._pending.append(SimpleNamespace(
+                            type="agent.tool_use", id=ev_id, name=c["tool"], input=c["args"],
+                            evaluated_permission="allow", evaluation=SimpleNamespace(type="always_allow")))
+                        text, is_error = self._execute_builtin(c["tool"], dict(c["args"]))
+                        self._pending.append(_tool_result(ev_id, text, is_error))
+                        continue
                     self._unresolved.add(ev_id)
                     self._builtin_calls[ev_id] = (c["tool"], dict(c["args"]))
+                    permission = self.builtin_permission  # "ask", or None for an unlabelled blocking event
                     self._pending.append(SimpleNamespace(
                         type="agent.tool_use", id=ev_id, name=c["tool"], input=c["args"],
-                        evaluated_permission="ask", evaluation=SimpleNamespace(type="always_ask")))
+                        evaluated_permission=permission,
+                        evaluation=SimpleNamespace(type="always_ask") if permission else None))
                 else:
                     self._unresolved.add(ev_id)
                     self._pending.append(
@@ -277,6 +296,16 @@ def _idle(reason: str, event_ids: list[str] | None = None):
     if event_ids is not None:
         stop.event_ids = event_ids
     return SimpleNamespace(type="session.status_idle", stop_reason=stop)
+
+
+def _server_render(name: str, text: str, is_error: bool) -> str:
+    if is_error:
+        return f"[sandbox] {text}"
+    if name == "read":
+        return "\n".join(f"{i:6}\t{line}" for i, line in enumerate(text.splitlines(), 1))
+    if name in ("glob", "grep"):
+        return "\n".join(reversed(text.splitlines()))
+    return text
 
 
 def _tool_result(tool_use_id: str, text: str, is_error: bool):

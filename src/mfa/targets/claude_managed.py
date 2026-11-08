@@ -242,6 +242,8 @@ class ClaudeManagedRunner:
         def send(*events: dict[str, Any]) -> None:
             sessions.events.send(session_id=session_id, events=list(events))
 
+        answered: set[str] = set()  # built-in tool_use ids we have sent a confirmation for
+
         def open_round() -> bool:
             nonlocal rounds, in_round
             if not in_round:
@@ -249,16 +251,43 @@ class ClaudeManagedRunner:
                 in_round = True
             return rounds > self.spec.max_iterations
 
+        awaiting_results: set[str] = set()  # server-run built-ins whose agent.tool_result has not arrived
+        interrupt_when_results_arrive = False
+
+        def deny_unanswered(reason: str, *, replace_queued: bool = False) -> list[dict[str, Any]]:
+            # A paused call that gets no answer would block the session for every later turn.
+            nonlocal queued
+            if replace_queued:
+                queued = [q for q in queued if q.get("type") != "user.tool_confirmation"]
+            events = []
+            for tool_use_id in pending:
+                if tool_use_id not in answered and not any(q.get("tool_use_id") == tool_use_id for q in queued):
+                    events.append(_confirmation(tool_use_id, "deny", reason))
+                    calls[pending[tool_use_id]].output = calls[pending[tool_use_id]].output or reason
+            return events
+
+        def flush(*extra: dict[str, Any]) -> None:
+            nonlocal queued
+            if queued or extra:
+                for q in queued:
+                    if q.get("type") == "user.tool_confirmation":
+                        answered.add(q["tool_use_id"])
+                send(*queued, *extra)
+                queued = []
+
         # Stream-first: open the stream, then send, so no early events are missed.
         with sessions.events.stream(session_id=session_id) as stream:
             send({"type": "user.message", "content": [{"type": "text", "text": user_input}]})
             for event in stream:
                 if time.monotonic() - start > DEFAULT_TURN_TIMEOUT_S:
-                    send({"type": "user.interrupt"})
                     error = f"turn exceeded {DEFAULT_TURN_TIMEOUT_S}s"
+                    denials = deny_unanswered(error, replace_queued=True)  # rebinds `queued`; extend after
+                    queued.extend(denials)
+                    flush({"type": "user.interrupt"})
                     break
 
                 if event.type == "agent.message":
+                    in_round = False  # a new model message: the next tool call opens a new round
                     text = "".join(b.text for b in event.content if b.type == "text")
                     if text:
                         final_text = text  # last message of the turn, same rule as LangGraph
@@ -297,11 +326,18 @@ class ClaudeManagedRunner:
                     if event.name == "read" and skill_root is None:
                         skill_root = skill_root_of(str(args.get("file_path", "")))
                     permission = getattr(event, "evaluated_permission", None)
+                    if permission == "allow":
+                        awaiting_results.add(event.id)
                     if past_cap:
-                        call.output = limit_text
                         error = limit_text
                         if permission == "ask":
+                            call.output = limit_text
                             queued.append(_confirmation(event.id, "deny", limit_text))
+                        else:
+                            # The server runs this one (auto / always_allow policy): keep its real
+                            # result, then stop the turn as soon as the results are in; the closest
+                            # match to the graph's refusal.
+                            interrupt_when_results_arrive = True
                     elif permission == "ask":
                         try:
                             self.sandbox.authorize(event.name, args)
@@ -313,12 +349,18 @@ class ClaudeManagedRunner:
                         call.output = f"Permission to use {event.name} has been denied."
                         server_denials += 1
                 elif event.type in ("agent.tool_result", "agent.mcp_tool_result"):
-                    idx = pending.get(getattr(event, "tool_use_id", None))
+                    in_round = False  # results follow every call of the model message
+                    tool_use_id = getattr(event, "tool_use_id", None)
+                    idx = pending.get(tool_use_id)
                     if idx is not None:
                         if getattr(event, "is_error", False):
                             builtin_errors += 1
                         if calls[idx].output is None:
                             calls[idx].output = _result_text(getattr(event, "content", None))
+                    awaiting_results.discard(tool_use_id)
+                    if interrupt_when_results_arrive and not awaiting_results:
+                        interrupt_when_results_arrive = False
+                        send({"type": "user.interrupt"})
                 elif event.type == "session.error":
                     err = getattr(event, "error", None)
                     retry = getattr(getattr(err, "retry_status", None), "type", None)
@@ -334,12 +376,18 @@ class ClaudeManagedRunner:
                     reason = event.stop_reason.type
                     if reason == "requires_action":
                         in_round = False  # all tool calls of this model message have been delivered
-                        if queued:
-                            # One request answers every paused call of the message; when the
-                            # round was past the cap it also stops the turn (an interrupted
-                            # turn ends with end_turn).
-                            send(*queued, *([{"type": "user.interrupt"}] if error == limit_text else []))
-                            queued = []
+                        # Anything the server is blocked on that we have no answer for is denied
+                        # (default-deny), so the session can never stay stuck in requires_action.
+                        blocked = list(getattr(event.stop_reason, "event_ids", None) or [])
+                        unknown = [i for i in blocked if i in pending and i not in answered
+                                   and not any(q.get("tool_use_id") == i for q in queued)]
+                        for tool_use_id in unknown:
+                            queued.append(_confirmation(tool_use_id, "deny", "Permission denied by the runner."))
+                            calls[pending[tool_use_id]].output = calls[pending[tool_use_id]].output or "Permission denied by the runner."
+                        # One request answers every paused call of the message; when the round
+                        # was past the cap it also stops the turn (an interrupted turn ends
+                        # with end_turn).
+                        flush(*([{"type": "user.interrupt"}] if error == limit_text and queued else []))
                         continue
                     if reason != "end_turn":
                         error = error or f"session stopped: {reason}"
@@ -483,8 +531,6 @@ class ClaudeManagedTarget:
             record["skills"] = uploaded
         if toolset := toolset_params(spec):
             record["toolset"] = [c["name"] for c in toolset["configs"] if c.get("enabled")]
-        if existing.get("skill_root"):
-            record["skill_root"] = existing["skill_root"]
         deployments.save(spec.name, CLAUDE_MANAGED, record)
         return record
 

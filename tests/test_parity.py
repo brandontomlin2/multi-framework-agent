@@ -289,7 +289,8 @@ SKILL_SPEC = replace(PARITY_SPEC, name="skill_parity_agent", skills=local_skills
 SCRIPT_SPEC = replace(SKILL_SPEC, name="script_parity_agent", allow_skill_scripts=True)
 SKILL_REF = "tests.test_parity:SKILL_SPEC"
 SCRIPT_REF = "tests.test_parity:SCRIPT_SPEC"
-ROOT = "/workspace/skills/parity-skill"
+DEFAULT_ROOT = "/workspace/skills"
+ROOT = f"{DEFAULT_ROOT}/parity-skill"
 SKILL_MD = (SKILLS_DIR / "parity-skill" / "SKILL.md").read_text()
 NOTES = (SKILLS_DIR / "parity-skill" / "references" / "notes.md").read_text()
 READ_SKILL = {"tool": "read", "args": {"file_path": f"{ROOT}/SKILL.md"}}
@@ -306,12 +307,17 @@ SKILL_SCENARIOS = {
         ("Two lines.", None, [("read", {"file_path": f"{ROOT}/references/notes.md", "view_range": ["1", "2"]}, "line one\nline two\n")]),
     ),
     "glob_and_grep_see_the_same_files": (
-        [{"tool": "glob", "args": {"pattern": "**/*.md"}}, {"tool": "grep", "args": {"pattern": "hello"}}, {"text": "Found."}],
+        [{"tool": "glob", "args": {"pattern": "**/*.md", "path": ROOT}}, {"tool": "grep", "args": {"pattern": "hello", "path": ROOT}}, {"text": "Found."}],
         ("Found.", None, [
-            ("glob", {"pattern": "**/*.md"}, f"{ROOT}/SKILL.md\n{ROOT}/references/notes.md"),
-            ("grep", {"pattern": "hello"}, f"{ROOT}/SKILL.md:8:Read `references/notes.md` for the notes. Run `scripts/hello.py` to say hello.\n"
-                                           f"{ROOT}/scripts/hello.py:3:print(\"hello from parity-skill\" + (\" \" + \" \".join(sys.argv[1:]) if len(sys.argv) > 1 else \"\"))"),
+            ("glob", {"pattern": "**/*.md", "path": ROOT}, f"{ROOT}/SKILL.md\n{ROOT}/references/notes.md"),
+            ("grep", {"pattern": "hello", "path": ROOT}, f"{ROOT}/SKILL.md:8:Read `references/notes.md` for the notes. Run `scripts/hello.py` to say hello.\n"
+                                                        f"{ROOT}/scripts/hello.py:3:print(\"hello from parity-skill\" + (\" \" + \" \".join(sys.argv[1:]) if len(sys.argv) > 1 else \"\"))"),
         ]),
+    ),
+    "glob_without_a_skill_path_is_refused": (
+        [{"tool": "glob", "args": {"pattern": "**/*"}}, {"text": "Refused."}],
+        ("Refused.", None, [("glob", {"pattern": "**/*"},
+                             f"Error: tool glob failed: PermissionError: glob and grep need a path inside a skill folder, e.g. {DEFAULT_ROOT}/<skill>")]),
     ),
     "mixed_round_custom_and_skill_read": (
         [{"calls": [BOOK_CALL, READ_SKILL]}, {"text": "Both."}],
@@ -333,13 +339,48 @@ SKILL_SCENARIOS = {
 }
 
 
+ANY = object()
+LANGGRAPH_TARGETS = (LOCAL, AGENT_ENGINE, CLOUD_RUN)
+
+
+def runner_authored(text) -> bool:
+    """Texts the mfa runner itself produces on CMA (denials, the cap); everything else a built-in returns is
+    rendered by the server, so only the LangGraph targets can be compared on it."""
+    return text is not None and (text.startswith("Error: tool") and "PermissionError" in text or text == iteration_limit_error(2))
+
+
+def cma_expected(expected):
+    output, error, calls = expected
+    return output, error, [(n, a, o if runner_authored(o) or n not in BUILTIN else ANY) for n, a, o in calls]
+
+
+BUILTIN = {"read", "glob", "grep", "bash"}
+
+
+def assert_matches(actual, expected, label):
+    assert (actual[0], actual[1]) == (expected[0], expected[1]), f"{label}: {actual}"
+    assert len(actual[2]) == len(expected[2]), f"{label}: {actual}"
+    for got, want in zip(actual[2], expected[2]):
+        assert got[0] == want[0] and got[1] == want[1], f"{label}: {got} != {want}"
+        if want[2] is ANY:
+            assert got[2] is not None, f"{label}: built-in call has no output: {got}"  # server-rendered
+        else:
+            assert got[2] == want[2], f"{label}: {got} != {want}"
+
+
 @pytest.mark.parametrize("scenario", list(SKILL_SCENARIOS))
 def test_skill_scenarios_match_on_every_target(scenario, make_runner):
+    """Byte-identical on the three LangGraph targets; on CMA the same calls, args, errors and runner-authored
+    texts, while the server's own rendering of an approved built-in call is a named divergence."""
     script, expected = SKILL_SCENARIOS[scenario]
-    for target in TARGETS:
+    for target in LANGGRAPH_TARGETS:
         r = make_runner(target, script, SKILL_SPEC, SKILL_REF).run("go")
         assert shape(r) == expected, f"{target}: {shape(r)}"
-        if expected[2] and expected[2][0][0] == "read" and "SKILL.md" in expected[2][0][1]["file_path"]:
+    cma = make_runner(CLAUDE_MANAGED, script, SKILL_SPEC, SKILL_REF).run("go")
+    assert_matches(shape(cma), cma_expected(expected), CLAUDE_MANAGED)
+    if expected[2] and expected[2][0][0] == "read" and "SKILL.md" in expected[2][0][1]["file_path"]:
+        for target in TARGETS:
+            r = cma if target == CLAUDE_MANAGED else make_runner(target, script, SKILL_SPEC, SKILL_REF).run("go")
             assert r.metadata.get("skills_used") == ["parity-skill"], target
 
 
@@ -374,9 +415,24 @@ def test_bash_runs_only_a_skills_own_scripts(make_runner):
         ("bash", bad["args"], "Error: tool bash failed: PermissionError: only a skill's own scripts/ may be run, "
                               "without shell operators: cat /etc/passwd | head"),
     ])
-    for target in TARGETS:
+    for target in LANGGRAPH_TARGETS:
         r = make_runner(target, [ok, bad, {"text": "Ran."}], SCRIPT_SPEC, SCRIPT_REF).run("go")
         assert shape(r) == expected, f"{target}: {shape(r)}"
+    runner = make_runner(CLAUDE_MANAGED, [ok, bad, {"text": "Ran."}], SCRIPT_SPEC, SCRIPT_REF)
+    assert_matches(shape(runner.run("go")), cma_expected(expected), CLAUDE_MANAGED)
+    denies = [e for e in runner.fake.sent if e["type"] == "user.tool_confirmation" and e["result"] == "deny"]
+    assert [d["deny_message"] for d in denies] == [expected[2][1][2]]  # the shell operators never reach the server
+
+
+def test_bash_rejects_what_the_servers_shell_would_interpret(make_runner):
+    """A second line, an interpreter by path, globs and comments are denied before the server's real shell sees them."""
+    for command in (f"python3 {ROOT}/scripts/hello.py\ncat /etc/passwd", f"/tmp/evil/python3 {ROOT}/scripts/hello.py",
+                    f"python3 {ROOT}/scripts/hello.py *", f"python3 {ROOT}/scripts/hello.py # ok", f"python3 {ROOT}/scripts/hello.py $(id)"):
+        runner = make_runner(CLAUDE_MANAGED, [{"tool": "bash", "args": {"command": command}}, {"text": "x"}], SCRIPT_SPEC, SCRIPT_REF)
+        cma = runner.run("go")
+        confirmation = [e for e in runner.fake.sent if e["type"] == "user.tool_confirmation"][0]
+        assert confirmation["result"] == "deny", command
+        assert cma.tool_calls[0].output.startswith("Error: tool bash failed: PermissionError"), command
 
 
 def test_bash_without_opt_in_is_refused_on_every_target(make_runner):
@@ -427,3 +483,60 @@ def test_cma_translation_attaches_skills_and_gates_the_file_tools():
     assert params["system"] == SKILL_SPEC.system_prompt  # the server announces skills itself
     assert client.uploaded == {"parity-skill": ["parity-skill/SKILL.md", "parity-skill/references/notes.md", "parity-skill/scripts/hello.py"]}
     assert rec["skills"]["parity-skill"]["version"] == "skillver_1" and rec["toolset"] == ["read", "glob", "grep"]
+
+
+def test_reads_are_allowed_under_whatever_root_the_server_announces(make_runner):
+    """CMA announces its own mount path for skills; authorisation keys on the skill name, not the root."""
+    for root in ("/mnt/skills/custom", "/sandbox/skills", "skills", ""):
+        file_path = f"{root}/parity-skill/references/notes.md".lstrip("/") if root == "" else f"{root}/parity-skill/references/notes.md"
+        runner = make_runner(CLAUDE_MANAGED, [{"tool": "read", "args": {"file_path": file_path}}, {"text": "ok"}], SKILL_SPEC, SKILL_REF)
+        runner.run("go")
+        confirmation = [e for e in runner.fake.sent if e["type"] == "user.tool_confirmation"][0]
+        assert confirmation["result"] == "allow", file_path
+    runner = make_runner(CLAUDE_MANAGED, [{"tool": "read", "args": {"file_path": "/mnt/skills/custom/parity-skill/SKILL.md"}}, {"text": "ok"}], SKILL_SPEC, SKILL_REF)
+    skill_md = runner.run("go")
+    assert skill_md.metadata["skill_root"] == "/mnt/skills/custom" and skill_md.metadata["skills_used"] == ["parity-skill"]
+    runner = make_runner(CLAUDE_MANAGED, [{"tool": "read", "args": {"file_path": "/mnt/skills/custom/other-skill/SKILL.md"}}, {"text": "ok"}], SKILL_SPEC, SKILL_REF)
+    runner.run("go")
+    assert [e["result"] for e in runner.fake.sent if e["type"] == "user.tool_confirmation"] == ["deny"]
+
+
+def test_server_run_builtins_still_count_rounds_and_stop_at_the_cap():
+    """Under an auto/always_allow policy the server runs the call itself; the runner must still count the round
+    and stop the turn past the cap instead of letting it run on."""
+    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
+    client = FakeCMAClient(script=[READ_SKILL] * 3 + [{"text": "never"}], spec=SKILL_SPEC, builtin_permission="allow")
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error == iteration_limit_error(2) and len(r.tool_calls) == 3
+    assert r.tool_calls[2].output is not None and not r.tool_calls[2].output.startswith("Error:")  # the server did run it
+    assert "user.interrupt" in [e["type"] for e in client.sent]
+
+    client = FakeCMAClient(script=[READ_SKILL, BOOK_CALL, BOOK_CALL, {"text": "x"}], spec=SKILL_SPEC, builtin_permission="allow")
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error == iteration_limit_error(2) and [c.name for c in r.tool_calls] == ["read", "book", "book"]
+    assert r.tool_calls[2].output == iteration_limit_error(2)  # the third round (a custom call) is refused like the graph does
+
+
+def test_blocked_calls_without_an_answer_are_denied_by_default():
+    """An agent.tool_use the server pauses on without labelling it 'ask' must not leave the session blocked."""
+    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
+    client = FakeCMAClient(script=[READ_SKILL, {"text": "done"}], spec=SKILL_SPEC, builtin_permission=None)
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    confirmations = [e for e in client.sent if e["type"] == "user.tool_confirmation"]
+    assert [c["result"] for c in confirmations] == ["deny"] and r.output == "done"
+    assert r.tool_calls[0].output == "Permission denied by the runner."
+
+
+def test_timeout_answers_paused_calls_before_interrupting(monkeypatch):
+    """A turn that times out between a paused call and its idle must not leave the call unanswered."""
+    import mfa.targets.claude_managed as cm
+
+    ticks = iter([0.0, 0.5, 100.0, 100.0, 100.0, 100.0])
+    monkeypatch.setattr(cm.time, "monotonic", lambda: next(ticks, 100.0))
+    monkeypatch.setattr(cm, "DEFAULT_TURN_TIMEOUT_S", 10.0)
+    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
+    client = FakeCMAClient(script=[READ_SKILL, {"text": "late"}], spec=SKILL_SPEC)
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error == "turn exceeded 10.0s"
+    last = client.batches[-1]
+    assert [e["type"] for e in last] == ["user.tool_confirmation", "user.interrupt"] and last[0]["result"] == "deny"
