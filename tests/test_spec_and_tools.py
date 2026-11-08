@@ -136,15 +136,19 @@ def test_open_meteo_retries_rate_limits(monkeypatch):
 
     calls = []
 
-    def flaky(url, timeout):
-        calls.append(url)
+    def flaky(req, timeout):
+        calls.append(req)
         if len(calls) < 3:
-            raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, None)
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
         return io.BytesIO(b'{"ok": true}')
 
     monkeypatch.setattr(weather.urllib.request, "urlopen", flaky)
     monkeypatch.setattr(weather.time, "sleep", lambda s: None)
     assert weather._get_json("https://x", {"a": 1}) == {"ok": True} and len(calls) == 3
+    # Open-Meteo throttles anonymous clients (429 for Python-urllib, resets for
+    # generic agents): every request, retries included, identifies this project.
+    assert calls[0].full_url == "https://x?a=1"
+    assert all(c.get_header("User-agent") == weather.USER_AGENT for c in calls)
 
     def always_404(url, timeout):
         raise urllib.error.HTTPError(url, 404, "nope", {}, None)

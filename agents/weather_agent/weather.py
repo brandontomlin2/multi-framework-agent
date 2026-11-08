@@ -22,6 +22,10 @@ from typing import Any
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 TIMEOUT_S = 10
+# Open-Meteo's edge throttles anonymous clients: Python's default ``Python-urllib``
+# agent is answered with 429 and generic agents get their connection reset, while
+# a client that identifies itself is served at once. Its terms ask for this anyway.
+USER_AGENT = "multi-framework-agent/0.1 (+https://github.com/brandontomlin2/multi-framework-agent)"
 
 # WMO weather interpretation codes, as documented by Open-Meteo.
 WMO_CODES = {
@@ -48,9 +52,10 @@ RETRY_DELAYS_S = (1.5, 3.0)  # Open-Meteo's free tier rate-limits bursts; two sh
 
 def _get_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
     full = f"{url}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(full, headers={"User-Agent": USER_AGENT})
     for attempt, delay in enumerate((*RETRY_DELAYS_S, None)):
         try:
-            with urllib.request.urlopen(full, timeout=TIMEOUT_S) as resp:
+            with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             if exc.code not in RETRY_STATUSES or delay is None:

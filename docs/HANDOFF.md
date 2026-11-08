@@ -51,7 +51,7 @@ If you change any of these, extend `tests/test_parity.py` first; it is the contr
 
 ## 5. Operating notes and gotchas
 
-- **Pin the data source when comparing targets.** `MFA_WEATHER_PROVIDER=fixture` for the example agent (the `evals.yml` default). The tool runs host-side for CMA too, so the variable set in your shell covers both targets. Live Open-Meteo is a smoke test, not a gate; the client now retries 429/5xx twice.
+- **Pin the data source when comparing targets.** `MFA_WEATHER_PROVIDER=fixture` for the example agent (the `evals.yml` default). The tool runs host-side for CMA too, so the variable set in your shell covers both targets. Live Open-Meteo is a smoke test, not a gate; the client retries 429/5xx twice and sends an identifying `User-Agent`, without which Open-Meteo's edge answers `Python-urllib` with 429 and resets connections from generic agents (that, not concurrency, was most of the first live run's 11/15 and 9/15).
 - **`max_iterations` is rounds, not calls**: one assistant message with several parallel tool calls is one round. The template graph enforces it itself (`iteration_cap_route`); `recursion_limit` is only a generous safety net.
 - **CMA built-ins must stay `always_ask`** for parity. `MFA_CMA_ENABLE_TOOLSET=1` (everything on, policy `auto`) is a parity-breaking experiment knob.
 - **Skill paths**: the model is told `/workspace/skills/<name>`; authorisation keys on the skill name after any root, so a different mount path on the service would not break reads.
