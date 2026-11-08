@@ -2,6 +2,9 @@
 
 * ``open-meteo`` (default): live data from Open-Meteo's free geocoding and
   forecast APIs (no API key). Hosts: geocoding-api.open-meteo.com, api.open-meteo.com.
+  With ``MFA_OPEN_METEO_API_KEY`` the customer hosts are used instead (per-key
+  limits rather than the free tier's per-IP ones); ``MFA_OPEN_METEO_GEOCODE_URL``
+  and ``MFA_OPEN_METEO_FORECAST_URL`` point at any other instance.
 * ``fixture``: deterministic offline data for tests and offline eval runs.
 
 Select with ``MFA_WEATHER_PROVIDER``. The provider is read on every call, so the
@@ -21,6 +24,12 @@ from typing import Any
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+# The free hosts are limited per source IP (600/min, 5,000/h, 10,000/day), so a
+# shared egress IP can be exhausted by other tenants. API customers use these
+# hosts with the same syntax plus ``apikey``; a self-hosted Open-Meteo can be
+# pointed at with the ``MFA_OPEN_METEO_*_URL`` overrides.
+CUSTOMER_GEOCODE_URL = "https://customer-geocoding-api.open-meteo.com/v1/search"
+CUSTOMER_FORECAST_URL = "https://customer-api.open-meteo.com/v1/forecast"
 TIMEOUT_S = 10
 # Open-Meteo's edge throttles anonymous clients: Python's default ``Python-urllib``
 # agent is answered with 429 and generic agents get their connection reset, while
@@ -64,6 +73,20 @@ def _get_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("unreachable")  # pragma: no cover
 
 
+def _endpoints() -> tuple[str, str, dict[str, str]]:
+    """``(geocode_url, forecast_url, auth_params)`` for this call, from the environment.
+
+    ``MFA_OPEN_METEO_API_KEY`` switches to Open-Meteo's customer hosts and adds the
+    key to every request; ``MFA_OPEN_METEO_GEOCODE_URL`` / ``MFA_OPEN_METEO_FORECAST_URL``
+    override either host (for example a self-hosted instance). Read on every call,
+    like the provider switch, so a deployed agent can be re-pointed without a restart.
+    """
+    key = os.environ.get("MFA_OPEN_METEO_API_KEY", "").strip()
+    geocode = os.environ.get("MFA_OPEN_METEO_GEOCODE_URL") or (CUSTOMER_GEOCODE_URL if key else GEOCODE_URL)
+    forecast = os.environ.get("MFA_OPEN_METEO_FORECAST_URL") or (CUSTOMER_FORECAST_URL if key else FORECAST_URL)
+    return geocode, forecast, ({"apikey": key} if key else {})
+
+
 def _report(place: dict[str, Any], day: str, current: dict[str, Any], daily: dict[str, Any]) -> dict[str, Any]:
     """Shape shared by both providers, so the agent sees the same thing either way."""
     return {
@@ -97,7 +120,8 @@ def open_meteo(location: str) -> dict[str, Any]:
     # Geocoding matches on the place name, so "Paris, France" is searched as "Paris"
     # and the rest is used to pick among the candidates.
     name, _, qualifier = location.partition(",")
-    geo = _get_json(GEOCODE_URL, {"name": name.strip(), "count": 10, "language": "en", "format": "json"})
+    geocode_url, forecast_url, auth = _endpoints()
+    geo = _get_json(geocode_url, {"name": name.strip(), "count": 10, "language": "en", "format": "json", **auth})
     results = geo.get("results") or []
     if not results:
         return _not_found(location)
@@ -106,13 +130,14 @@ def open_meteo(location: str) -> dict[str, Any]:
         (r for r in results if q and q in f"{r.get('admin1', '')} {r.get('country', '')} {r.get('country_code', '')}".lower()),
         results[0],
     )
-    fc = _get_json(FORECAST_URL, {
+    fc = _get_json(forecast_url, {
         "latitude": place["latitude"],
         "longitude": place["longitude"],
         "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
         "timezone": "auto",
         "forecast_days": 1,
+        **auth,
     })
     cur, daily = fc.get("current", {}), fc.get("daily", {})
 

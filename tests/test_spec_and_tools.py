@@ -65,6 +65,37 @@ def test_open_meteo_parsing_and_disambiguation():
         assert weather.open_meteo("Nowhere")["found"] is False
 
 
+def test_open_meteo_api_key_switches_to_customer_hosts(monkeypatch):
+    seen: list[tuple[str, dict]] = []
+
+    def recording(url, params):
+        seen.append((url, params))
+        return _fake_open_meteo(url, params)
+
+    # Free hosts, no key: nothing is added to the query.
+    with mock.patch.object(weather, "_get_json", side_effect=recording):
+        assert weather.open_meteo("Portland, Oregon")["found"] is True
+    assert [u for u, _ in seen] == [weather.GEOCODE_URL, weather.FORECAST_URL]
+    assert all("apikey" not in p for _, p in seen)
+
+    # A key moves both calls to the customer hosts and rides along on each request.
+    seen.clear()
+    monkeypatch.setenv("MFA_OPEN_METEO_API_KEY", "k-123")
+    with mock.patch.object(weather, "_get_json", side_effect=recording):
+        assert weather.open_meteo("Portland, Oregon")["found"] is True
+    assert [u for u, _ in seen] == [weather.CUSTOMER_GEOCODE_URL, weather.CUSTOMER_FORECAST_URL]
+    assert all(p["apikey"] == "k-123" for _, p in seen)
+
+    # Explicit URLs win (a self-hosted instance), with or without a key.
+    seen.clear()
+    monkeypatch.delenv("MFA_OPEN_METEO_API_KEY")
+    monkeypatch.setenv("MFA_OPEN_METEO_FORECAST_URL", "http://localhost:8080/v1/forecast")
+    with mock.patch.object(weather, "_get_json", side_effect=recording):
+        weather.open_meteo("Portland")
+    assert [u for u, _ in seen] == [weather.GEOCODE_URL, "http://localhost:8080/v1/forecast"]
+    assert all("apikey" not in p for _, p in seen)
+
+
 def test_live_provider_failure_is_reported_not_raised(monkeypatch):
     monkeypatch.setenv("MFA_WEATHER_PROVIDER", "open-meteo")
     with mock.patch.object(weather, "_get_json", side_effect=OSError("network down")):

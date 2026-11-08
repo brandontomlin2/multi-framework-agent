@@ -17,6 +17,8 @@ def _tmp_deployments(tmp_path, monkeypatch):
 def _offline_weather(monkeypatch):
     # Tests never hit the network: the example agent's tool uses deterministic fixtures.
     monkeypatch.setenv("MFA_WEATHER_PROVIDER", "fixture")
+    for name in ("MFA_OPEN_METEO_API_KEY", "MFA_OPEN_METEO_GEOCODE_URL", "MFA_OPEN_METEO_FORECAST_URL"):
+        monkeypatch.delenv(name, raising=False)
     # Skill locations are announced under the default virtual root in every test.
     monkeypatch.delenv("MFA_SKILLS_ROOT", raising=False)
     monkeypatch.delenv("MFA_EFFORT", raising=False)
