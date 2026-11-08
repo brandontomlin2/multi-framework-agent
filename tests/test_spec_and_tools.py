@@ -128,3 +128,27 @@ def test_skill_folders_load_and_validate(tmp_path):
         AgentSpec(name="x", description="d", system_prompt="p", tools=[read])
     with pytest.raises(ValueError, match="unique"):
         AgentSpec(name="x", description="d", system_prompt="p", tools=[], skills=[sk, sk])
+
+
+def test_open_meteo_retries_rate_limits(monkeypatch):
+    import io
+    import urllib.error
+
+    calls = []
+
+    def flaky(url, timeout):
+        calls.append(url)
+        if len(calls) < 3:
+            raise urllib.error.HTTPError(url, 429, "Too Many Requests", {}, None)
+        return io.BytesIO(b'{"ok": true}')
+
+    monkeypatch.setattr(weather.urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(weather.time, "sleep", lambda s: None)
+    assert weather._get_json("https://x", {"a": 1}) == {"ok": True} and len(calls) == 3
+
+    def always_404(url, timeout):
+        raise urllib.error.HTTPError(url, 404, "nope", {}, None)
+
+    monkeypatch.setattr(weather.urllib.request, "urlopen", always_404)
+    with pytest.raises(urllib.error.HTTPError):
+        weather._get_json("https://x", {})

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date
@@ -40,9 +42,21 @@ def c_to_f(c: float | None) -> float | None:
     return None if c is None else round(c * 9 / 5 + 32, 1)
 
 
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+RETRY_DELAYS_S = (1.5, 3.0)  # Open-Meteo's free tier rate-limits bursts; two short retries ride them out
+
+
 def _get_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
-    with urllib.request.urlopen(f"{url}?{urllib.parse.urlencode(params)}", timeout=TIMEOUT_S) as resp:
-        return json.loads(resp.read())
+    full = f"{url}?{urllib.parse.urlencode(params)}"
+    for attempt, delay in enumerate((*RETRY_DELAYS_S, None)):
+        try:
+            with urllib.request.urlopen(full, timeout=TIMEOUT_S) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code not in RETRY_STATUSES or delay is None:
+                raise
+            time.sleep(delay)
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 def _report(place: dict[str, Any], day: str, current: dict[str, Any], daily: dict[str, Any]) -> dict[str, Any]:
