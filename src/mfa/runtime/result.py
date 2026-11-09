@@ -11,6 +11,7 @@ class ToolCall(BaseModel):
     name: str
     args: dict[str, Any] = Field(default_factory=dict)
     output: str | None = None
+    is_error: bool = False  # the output is an error text (tool raised, was refused, or hit the iteration cap)
 
 
 class AgentResult(BaseModel):

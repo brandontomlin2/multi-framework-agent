@@ -13,16 +13,27 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
-from fastapi.testclient import TestClient
+from dataclasses import replace
+from pathlib import Path
 
-from mfa.runtime.result import AgentResult
-from mfa.spec import AGENT_ENGINE, CLAUDE_MANAGED, CLOUD_RUN, LOCAL, AgentSpec, format_tool_error, iteration_limit_error, tool
 from mfa.runtime.graph import recursion_limit_for
-from mfa.targets.agent_engine import AgentEngineRunner
-from mfa.targets.agent_engine_app import LangGraphAgentApp
+from mfa.runtime.result import AgentResult
+from mfa.spec import anthropic_skill
+from mfa.skills import skills_prompt_block
+from mfa.spec import (
+    AGENT_ENGINE,
+    CLAUDE_MANAGED,
+    CLOUD_RUN,
+    LOCAL,
+    AgentSpec,
+    format_tool_error,
+    iteration_limit_error,
+    local_skills,
+    tool,
+)
 from mfa.targets.claude_managed import ClaudeManagedRunner
 from mfa.targets.local import LocalRunner
-from tests.fakes import FakeCMAClient, FakeRemoteAgentEngine, ScriptedChatModel
+from tests.fakes import FakeCMAClient, ScriptedChatModel
 
 
 @tool
@@ -110,58 +121,10 @@ def shape(r: AgentResult):
     return r.output, r.error, [(c.name, c.args, c.output) for c in r.tool_calls]
 
 
-class _HttpRunner:
-    """cloud_run as the evals see it: the FastAPI route, parsed back into an AgentResult."""
-
-    target = CLOUD_RUN
-
-    def __init__(self, client: TestClient):
-        self.client = client
-
-    def run(self, user_input, *, thread_id=None):
-        body = self.client.post("/mfa/query", json={"input": user_input, "thread_id": thread_id})
-        assert body.status_code == 200, body.text
-        return AgentResult.model_validate(body.json())
-
-
-@pytest.fixture
-def make_runner(monkeypatch):
-    """Build a runner for any target that replays ``script`` through the real adapter code."""
-    from mfa.serving import load_root_agent
-
-    made = []
-
-    def _make(target: str, script: list[dict]):
-        if target == LOCAL:
-            return LocalRunner(PARITY_SPEC, chat_model=ScriptedChatModel(script=list(script)))
-        if target == AGENT_ENGINE:
-            monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=list(script)))
-            app = LangGraphAgentApp(agent_ref=SELF_REF, model="x:y")
-            app.set_up()
-            return AgentEngineRunner(FakeRemoteAgentEngine(app), "projects/p/locations/l/reasoningEngines/1")
-        if target == CLOUD_RUN:
-            load_root_agent.cache_clear()
-            monkeypatch.setenv("MFA_AGENT", SELF_REF)
-            monkeypatch.setenv("MFA_MODEL", "x:y")
-            monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=list(script)))
-            from mfa.serving.fast_api_app import create_app
-
-            made.append(load_root_agent)
-            return _HttpRunner(TestClient(create_app()))
-        if target == CLAUDE_MANAGED:
-            record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "claude-test"}
-            return ClaudeManagedRunner(PARITY_SPEC, record, client=FakeCMAClient(script=list(script)))
-        raise ValueError(target)
-
-    yield _make
-    for cache in made:
-        cache.cache_clear()
-
-
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 def test_every_target_returns_the_same_result(scenario, make_runner):
     script, expected = SCENARIOS[scenario]
-    results = {t: make_runner(t, script).run("go") for t in TARGETS}
+    results = {t: make_runner(t, script, PARITY_SPEC, SELF_REF).run("go") for t in TARGETS}
     for target, r in results.items():
         assert shape(r) == expected, f"{target}: {shape(r)}"
         assert r.target == target
@@ -169,7 +132,7 @@ def test_every_target_returns_the_same_result(scenario, make_runner):
 
 @pytest.mark.parametrize("target", TARGETS)
 def test_second_turn_sees_the_first_and_reports_only_itself(target, make_runner):
-    runner = make_runner(target, [BOOK_CALL, {"text": "Booked."}, {"text": "Anything else?"}])
+    runner = make_runner(target, [BOOK_CALL, {"text": "Booked."}, {"text": "Anything else?"}], PARITY_SPEC, SELF_REF)
     first = runner.run("book two seats tomorrow", thread_id="thread-1")
     second = runner.run("thanks", thread_id="thread-1")
     assert shape(first) == SCENARIOS["happy_path_coerces_arguments"][1]
@@ -179,7 +142,7 @@ def test_second_turn_sees_the_first_and_reports_only_itself(target, make_runner)
 @pytest.mark.parametrize("target", TARGETS)
 def test_thread_recovers_after_a_failed_turn(target, make_runner):
     """A turn that hit the iteration limit must not poison the thread for the next turn."""
-    runner = make_runner(target, [BOOK_CALL] * 3 + [{"text": "Recovered."}])  # 3rd call is the one past the limit
+    runner = make_runner(target, [BOOK_CALL] * 3 + [{"text": "Recovered."}], PARITY_SPEC, SELF_REF)  # 3rd call is past the cap
     failed = runner.run("loop", thread_id="t")
     assert failed.error == iteration_limit_error(2)
     again = runner.run("try again", thread_id="t")
@@ -229,9 +192,9 @@ def test_tool_error_text_is_shared():
 @pytest.mark.parametrize("target", TARGETS)
 def test_max_iterations_rounds_are_allowed_and_one_more_is_not(target, make_runner):
     """n tool rounds plus an answer must succeed; the (n+1)th round is refused everywhere."""
-    exactly = make_runner(target, [BOOK_CALL] * PARITY_SPEC.max_iterations + [{"text": "Done."}]).run("go")
+    exactly = make_runner(target, [BOOK_CALL] * PARITY_SPEC.max_iterations + [{"text": "Done."}], PARITY_SPEC, SELF_REF).run("go")
     assert exactly.error is None and exactly.output == "Done." and len(exactly.tool_calls) == PARITY_SPEC.max_iterations
-    one_more = make_runner(target, [BOOK_CALL] * (PARITY_SPEC.max_iterations + 1) + [{"text": "Done."}]).run("go")
+    one_more = make_runner(target, [BOOK_CALL] * (PARITY_SPEC.max_iterations + 1) + [{"text": "Done."}], PARITY_SPEC, SELF_REF).run("go")
     assert one_more.error == iteration_limit_error(PARITY_SPEC.max_iterations)
     assert len(one_more.tool_calls) == PARITY_SPEC.max_iterations + 1
 
@@ -282,8 +245,6 @@ def _two_node_custom_graph(spec, model, *, checkpointer=None):
 
 
 def test_custom_graph_builder_gets_the_same_cap_and_recovers():
-    from dataclasses import replace
-
     spec = replace(PARITY_SPEC, graph_builder=_two_node_custom_graph)
     ok = LocalRunner(spec, chat_model=ScriptedChatModel(script=[BOOK_CALL] * 2 + [{"text": "Done."}])).run("go")
     assert ok.error is None and ok.output == "Done." and len(ok.tool_calls) == 2  # n rounds + answer pass
@@ -296,8 +257,6 @@ def test_custom_graph_builder_gets_the_same_cap_and_recovers():
 
 
 def test_interrupt_before_graph_is_left_pending_not_reported_as_the_cap():
-    from dataclasses import replace
-
     def hitl(spec, model, *, checkpointer=None):
         from langchain_core.messages import SystemMessage
         from langgraph.checkpoint.memory import InMemorySaver
@@ -319,3 +278,333 @@ def test_interrupt_before_graph_is_left_pending_not_reported_as_the_cap():
     assert r.error is None and r.metadata["pending_nodes"] == ["tools"]
     assert [(c.name, c.output) for c in r.tool_calls] == [("book", None)]  # waiting for approval, not refused
     assert runner.graph.get_state({"configurable": {"thread_id": "t"}}).next == ("tools",)
+
+
+# --- Agent Skills -----------------------------------------------------------
+# The same skill folder is read through LangGraph's sandbox tools and, on Claude
+# Managed Agents, through the built-in tools the runner approves with the same
+# sandbox rules. Locations are announced under one virtual root on every target.
+
+SKILLS_DIR = Path(__file__).parent / "skills"
+SKILL_SPEC = replace(PARITY_SPEC, name="skill_parity_agent", skills=local_skills(SKILLS_DIR))
+SCRIPT_SPEC = replace(SKILL_SPEC, name="script_parity_agent", allow_skill_scripts=True)
+SKILL_REF = "tests.test_parity:SKILL_SPEC"
+SCRIPT_REF = "tests.test_parity:SCRIPT_SPEC"
+DEFAULT_ROOT = "/workspace/skills"
+ROOT = f"{DEFAULT_ROOT}/parity-skill"
+SKILL_MD = (SKILLS_DIR / "parity-skill" / "SKILL.md").read_text()
+NOTES = (SKILLS_DIR / "parity-skill" / "references" / "notes.md").read_text()
+READ_SKILL = {"tool": "read", "args": {"file_path": f"{ROOT}/SKILL.md"}}
+READ_NOTES = {"tool": "read", "args": {"file_path": f"{ROOT}/references/notes.md"}}
+OUTSIDE = "Error: tool read failed: PermissionError: /etc/passwd is not inside a skill folder (/workspace/skills/<skill>/...)"
+
+SKILL_SCENARIOS = {
+    "skill_is_read_on_demand": (
+        [READ_SKILL, READ_NOTES, {"text": "Noted."}],
+        ("Noted.", None, [("read", READ_SKILL["args"], SKILL_MD), ("read", READ_NOTES["args"], NOTES)]),
+    ),
+    "view_range_is_coerced": (
+        [{"tool": "read", "args": {"file_path": f"{ROOT}/references/notes.md", "view_range": ["1", "2"]}}, {"text": "Two lines."}],
+        ("Two lines.", None, [("read", {"file_path": f"{ROOT}/references/notes.md", "view_range": ["1", "2"]}, "line one\nline two\n")]),
+    ),
+    "glob_and_grep_see_the_same_files": (
+        [{"tool": "glob", "args": {"pattern": "**/*.md", "path": ROOT}}, {"tool": "grep", "args": {"pattern": "hello", "path": ROOT}}, {"text": "Found."}],
+        ("Found.", None, [
+            ("glob", {"pattern": "**/*.md", "path": ROOT}, f"{ROOT}/SKILL.md\n{ROOT}/references/notes.md"),
+            ("grep", {"pattern": "hello", "path": ROOT}, f"{ROOT}/SKILL.md:8:Read `references/notes.md` for the notes. Run `scripts/hello.py` to say hello.\n"
+                                                        f"{ROOT}/scripts/hello.py:3:print(\"hello from parity-skill\" + (\" \" + \" \".join(sys.argv[1:]) if len(sys.argv) > 1 else \"\"))"),
+        ]),
+    ),
+    "glob_without_a_skill_path_is_refused": (
+        [{"tool": "glob", "args": {"pattern": "**/*"}}, {"text": "Refused."}],
+        ("Refused.", None, [("glob", {"pattern": "**/*"},
+                             f"Error: tool glob failed: PermissionError: glob and grep need a path inside a skill folder, e.g. {DEFAULT_ROOT}/<skill>")]),
+    ),
+    "mixed_round_custom_and_skill_read": (
+        [{"calls": [BOOK_CALL, READ_SKILL]}, {"text": "Both."}],
+        ("Both.", None, [("book", BOOK_CALL["args"], BOOKED), ("read", READ_SKILL["args"], SKILL_MD)]),
+    ),
+    "missing_skill_file_is_an_error": (
+        [{"tool": "read", "args": {"file_path": f"{ROOT}/references/missing.md"}}, {"text": "No file."}],
+        ("No file.", None, [("read", {"file_path": f"{ROOT}/references/missing.md"},
+                             f"Error: tool read failed: FileNotFoundError: no such file in skill folder: {ROOT}/references/missing.md")]),
+    ),
+    "path_outside_skills_is_refused": (
+        [{"tool": "read", "args": {"file_path": "/etc/passwd"}}, {"text": "Refused."}],
+        ("Refused.", None, [("read", {"file_path": "/etc/passwd"}, OUTSIDE)]),
+    ),
+    "skill_reads_count_toward_the_cap": (
+        [READ_SKILL] * 3 + [{"text": "never"}],
+        ("", iteration_limit_error(2), [("read", READ_SKILL["args"], SKILL_MD)] * 2 + [("read", READ_SKILL["args"], iteration_limit_error(2))]),
+    ),
+}
+
+
+ANY = object()
+LANGGRAPH_TARGETS = (LOCAL, AGENT_ENGINE, CLOUD_RUN)
+
+
+def runner_authored(text) -> bool:
+    """Texts the mfa runner itself produces on CMA (denials, the cap); everything else a built-in returns is
+    rendered by the server, so only the LangGraph targets can be compared on it."""
+    return text is not None and (text.startswith("Error: tool") and "PermissionError" in text or text == iteration_limit_error(2))
+
+
+def cma_expected(expected):
+    output, error, calls = expected
+    return output, error, [(n, a, o if runner_authored(o) or n not in BUILTIN else ANY) for n, a, o in calls]
+
+
+BUILTIN = {"read", "glob", "grep", "bash"}
+
+
+def assert_matches(actual, expected, label):
+    assert (actual[0], actual[1]) == (expected[0], expected[1]), f"{label}: {actual}"
+    assert len(actual[2]) == len(expected[2]), f"{label}: {actual}"
+    for got, want in zip(actual[2], expected[2]):
+        assert got[0] == want[0] and got[1] == want[1], f"{label}: {got} != {want}"
+        if want[2] is ANY:
+            assert got[2] is not None, f"{label}: built-in call has no output: {got}"  # server-rendered
+        else:
+            assert got[2] == want[2], f"{label}: {got} != {want}"
+
+
+@pytest.mark.parametrize("scenario", list(SKILL_SCENARIOS))
+def test_skill_scenarios_match_on_every_target(scenario, make_runner):
+    """Byte-identical on the three LangGraph targets; on CMA the same calls, args, errors and runner-authored
+    texts, while the server's own rendering of an approved built-in call is a named divergence."""
+    script, expected = SKILL_SCENARIOS[scenario]
+    for target in LANGGRAPH_TARGETS:
+        r = make_runner(target, script, SKILL_SPEC, SKILL_REF).run("go")
+        assert shape(r) == expected, f"{target}: {shape(r)}"
+    cma = make_runner(CLAUDE_MANAGED, script, SKILL_SPEC, SKILL_REF).run("go")
+    assert_matches(shape(cma), cma_expected(expected), CLAUDE_MANAGED)
+    if expected[2] and expected[2][0][0] == "read" and "SKILL.md" in expected[2][0][1]["file_path"]:
+        for target in TARGETS:
+            r = cma if target == CLAUDE_MANAGED else make_runner(target, script, SKILL_SPEC, SKILL_REF).run("go")
+            assert r.metadata.get("skills_used") == ["parity-skill"], target
+
+
+def test_refused_skill_read_never_runs_on_cma(make_runner):
+    runner = make_runner(CLAUDE_MANAGED, [{"tool": "read", "args": {"file_path": "/etc/passwd"}}, {"text": "x"}], SKILL_SPEC, SKILL_REF)
+    runner.run("go")
+    confirmations = [e for e in runner.fake.sent if e["type"] == "user.tool_confirmation"]
+    assert confirmations == [{"type": "user.tool_confirmation", "tool_use_id": confirmations[0]["tool_use_id"],
+                              "result": "deny", "deny_message": OUTSIDE}]
+
+
+def test_cap_on_cma_denies_the_paused_read_and_interrupts_in_one_batch(make_runner):
+    runner = make_runner(CLAUDE_MANAGED, [READ_SKILL] * 3 + [{"text": "never"}], SKILL_SPEC, SKILL_REF)
+    assert runner.run("go").error == iteration_limit_error(2)
+    last = runner.fake.batches[-1]
+    assert [e["type"] for e in last] == ["user.tool_confirmation", "user.interrupt"]
+    assert last[0]["result"] == "deny" and last[0]["deny_message"] == iteration_limit_error(2)
+
+
+def test_mixed_round_sends_the_confirmation_at_the_round_boundary(make_runner):
+    runner = make_runner(CLAUDE_MANAGED, [{"calls": [BOOK_CALL, READ_SKILL]}, {"text": "Both."}], SKILL_SPEC, SKILL_REF)
+    assert runner.run("go").output == "Both."
+    kinds = [[e["type"] for e in b] for b in runner.fake.batches]
+    assert kinds == [["user.message"], ["user.custom_tool_result"], ["user.tool_confirmation"]]
+
+
+def test_bash_runs_only_a_skills_own_scripts(make_runner):
+    ok = {"tool": "bash", "args": {"command": f"python3 {ROOT}/scripts/hello.py there"}}
+    bad = {"tool": "bash", "args": {"command": "cat /etc/passwd | head"}}
+    expected = ("Ran.", None, [
+        ("bash", ok["args"], "hello from parity-skill there\n"),
+        ("bash", bad["args"], "Error: tool bash failed: PermissionError: only a skill's own scripts/ may be run, "
+                              "without shell operators: cat /etc/passwd | head"),
+    ])
+    for target in LANGGRAPH_TARGETS:
+        r = make_runner(target, [ok, bad, {"text": "Ran."}], SCRIPT_SPEC, SCRIPT_REF).run("go")
+        assert shape(r) == expected, f"{target}: {shape(r)}"
+    runner = make_runner(CLAUDE_MANAGED, [ok, bad, {"text": "Ran."}], SCRIPT_SPEC, SCRIPT_REF)
+    assert_matches(shape(runner.run("go")), cma_expected(expected), CLAUDE_MANAGED)
+    denies = [e for e in runner.fake.sent if e["type"] == "user.tool_confirmation" and e["result"] == "deny"]
+    assert [d["deny_message"] for d in denies] == [expected[2][1][2]]  # the shell operators never reach the server
+
+
+def test_bash_rejects_what_the_servers_shell_would_interpret(make_runner):
+    """A second line, an interpreter by path, globs and comments are denied before the server's real shell sees them."""
+    for command in (f"python3 {ROOT}/scripts/hello.py\ncat /etc/passwd", f"/tmp/evil/python3 {ROOT}/scripts/hello.py",
+                    f"python3 {ROOT}/scripts/hello.py *", f"python3 {ROOT}/scripts/hello.py # ok", f"python3 {ROOT}/scripts/hello.py $(id)"):
+        runner = make_runner(CLAUDE_MANAGED, [{"tool": "bash", "args": {"command": command}}, {"text": "x"}], SCRIPT_SPEC, SCRIPT_REF)
+        cma = runner.run("go")
+        confirmation = [e for e in runner.fake.sent if e["type"] == "user.tool_confirmation"][0]
+        assert confirmation["result"] == "deny", command
+        assert cma.tool_calls[0].output.startswith("Error: tool bash failed: PermissionError"), command
+
+
+def test_bash_without_opt_in_is_refused_on_every_target(make_runner):
+    """Named divergence: LangGraph does not bind bash at all; the server refuses the disabled tool."""
+    script = [{"tool": "bash", "args": {"command": f"python3 {ROOT}/scripts/hello.py"}}, {"text": "x"}]
+    lg = make_runner(LOCAL, script, SKILL_SPEC, SKILL_REF).run("go")
+    assert lg.tool_calls[0].output == "Error: unknown tool bash; available tools: book, boom, read, glob, grep"
+    cma = make_runner(CLAUDE_MANAGED, script, SKILL_SPEC, SKILL_REF).run("go")
+    assert cma.tool_calls[0].output == "Permission to use bash has been denied."
+    assert cma.metadata["server_denials"] == 1
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_skill_spec_threads_recover_after_a_capped_turn(target, make_runner):
+    runner = make_runner(target, [READ_SKILL] * 3 + [{"text": "Recovered."}], SKILL_SPEC, SKILL_REF)
+    assert runner.run("loop", thread_id="t").error == iteration_limit_error(2)
+    assert shape(runner.run("again", thread_id="t")) == ("Recovered.", None, [])
+
+
+def test_langgraph_announces_skills_and_binds_the_toolset_schemas():
+    model = ScriptedChatModel(script=[{"text": "hi"}])
+    LocalRunner(SKILL_SPEC, chat_model=model).run("hello")
+    system = model.seen_messages[0][0].content
+    assert system == SKILL_SPEC.system_prompt + "\n\n" + skills_prompt_block(SKILL_SPEC)
+    assert f"- parity-skill: {SKILL_SPEC.skills[0].description} (location: {ROOT})" in system
+    bound = {t.name: t.args_schema for t in model.bound_tools}
+    assert list(bound) == ["book", "boom", "read", "glob", "grep"]
+    assert set(bound["read"]["properties"]) == {"file_path", "view_range"}
+    assert set(bound["glob"]["properties"]) == {"pattern", "path"} == set(bound["grep"]["properties"])
+    scripted = ScriptedChatModel(script=[{"text": "hi"}])
+    LocalRunner(SCRIPT_SPEC, chat_model=scripted).run("hello")
+    assert set({t.name: t for t in scripted.bound_tools}["bash"].args_schema["properties"]) == {"command", "restart", "timeout_ms"}
+
+
+def test_cma_translation_attaches_skills_and_gates_the_file_tools():
+    from mfa.targets.claude_managed import ClaudeManagedTarget
+
+    client = FakeCMAClient(spec=SKILL_SPEC)
+    rec = ClaudeManagedTarget().deploy(SKILL_SPEC, client=client)
+    params = client.created_agents[0]
+    assert params["skills"] == [{"type": "custom", "skill_id": "skill_fake_parity-skill", "version": "skillver_1"}]
+    toolset = params["tools"][0]
+    assert toolset["type"] == "agent_toolset_20260401"
+    assert toolset["default_config"] == {"enabled": False, "permission_policy": {"type": "always_ask"}}
+    assert [(c["name"], c.get("enabled")) for c in toolset["configs"]] == [
+        ("read", True), ("glob", True), ("grep", True), ("web_fetch", False), ("web_search", False)]
+    assert [t["name"] for t in params["tools"][1:]] == ["book", "boom"]
+    assert params["system"] == SKILL_SPEC.system_prompt  # the server announces skills itself
+    assert client.uploaded == {"parity-skill": ["parity-skill/SKILL.md", "parity-skill/references/notes.md", "parity-skill/scripts/hello.py"]}
+    assert rec["skills"]["parity-skill"]["version"] == "skillver_1"
+    assert rec["toolset"] == {"policy": "always_ask", "enabled": ["read", "glob", "grep"], "disabled": []}
+
+
+def test_reads_are_allowed_under_whatever_root_the_server_announces(make_runner):
+    """CMA announces its own mount path for skills; authorisation keys on the skill name, not the root."""
+    for root in ("/mnt/skills/custom", "/sandbox/skills", "skills", ""):
+        file_path = f"{root}/parity-skill/references/notes.md".lstrip("/") if root == "" else f"{root}/parity-skill/references/notes.md"
+        runner = make_runner(CLAUDE_MANAGED, [{"tool": "read", "args": {"file_path": file_path}}, {"text": "ok"}], SKILL_SPEC, SKILL_REF)
+        runner.run("go")
+        confirmation = [e for e in runner.fake.sent if e["type"] == "user.tool_confirmation"][0]
+        assert confirmation["result"] == "allow", file_path
+    runner = make_runner(CLAUDE_MANAGED, [{"tool": "read", "args": {"file_path": "/mnt/skills/custom/parity-skill/SKILL.md"}}, {"text": "ok"}], SKILL_SPEC, SKILL_REF)
+    skill_md = runner.run("go")
+    assert skill_md.metadata["skill_root"] == "/mnt/skills/custom" and skill_md.metadata["skills_used"] == ["parity-skill"]
+    runner = make_runner(CLAUDE_MANAGED, [{"tool": "read", "args": {"file_path": "/mnt/skills/custom/other-skill/SKILL.md"}}, {"text": "ok"}], SKILL_SPEC, SKILL_REF)
+    denied = runner.run("go")
+    assert [e["result"] for e in runner.fake.sent if e["type"] == "user.tool_confirmation"] == ["deny"]
+    assert "skills_used" not in denied.metadata and denied.tool_calls[0].is_error is True  # a refused read is not a skill used
+
+
+def test_server_run_builtins_still_count_rounds_and_stop_at_the_cap():
+    """Under an auto/always_allow policy the server runs the call itself; the runner must still count the round
+    and stop the turn past the cap instead of letting it run on."""
+    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
+    client = FakeCMAClient(script=[READ_SKILL] * 3 + [{"text": "never"}], spec=SKILL_SPEC, builtin_permission="allow")
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error == iteration_limit_error(2) and len(r.tool_calls) == 3
+    assert r.tool_calls[2].output is not None and not r.tool_calls[2].output.startswith("Error:")  # the server did run it
+    assert "user.interrupt" in [e["type"] for e in client.sent]
+
+    client = FakeCMAClient(script=[READ_SKILL, BOOK_CALL, BOOK_CALL, {"text": "x"}], spec=SKILL_SPEC, builtin_permission="allow")
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error == iteration_limit_error(2) and [c.name for c in r.tool_calls] == ["read", "book", "book"]
+    assert r.tool_calls[2].output == iteration_limit_error(2)  # the third round (a custom call) is refused like the graph does
+
+
+def test_blocked_calls_without_an_answer_are_denied_by_default():
+    """An agent.tool_use the server pauses on without labelling it 'ask' must not leave the session blocked."""
+    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
+    client = FakeCMAClient(script=[READ_SKILL, {"text": "done"}], spec=SKILL_SPEC, builtin_permission=None)
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    confirmations = [e for e in client.sent if e["type"] == "user.tool_confirmation"]
+    assert [c["result"] for c in confirmations] == ["deny"] and r.output == "done"
+    assert r.tool_calls[0].output == "Permission denied by the runner."
+
+
+def test_timeout_answers_paused_calls_before_interrupting(monkeypatch):
+    """A turn that times out between a paused call and its idle must not leave the call unanswered."""
+    import mfa.targets.claude_managed as cm
+
+    ticks = iter([0.0, 0.5, 0.5, 100.0, 100.0, 100.0, 100.0])  # start; span start; the paused call; then the clock jumps
+    monkeypatch.setattr(cm.time, "monotonic", lambda: next(ticks, 100.0))
+    monkeypatch.setattr(cm, "DEFAULT_TURN_TIMEOUT_S", 10.0)
+    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
+    client = FakeCMAClient(script=[READ_SKILL, {"text": "late"}], spec=SKILL_SPEC)
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error == "turn exceeded 10.0s"
+    last = client.batches[-1]
+    assert [e["type"] for e in last] == ["user.tool_confirmation", "user.interrupt"] and last[0]["result"] == "deny"
+
+
+XLSX_SPEC = replace(SKILL_SPEC, name="xlsx_parity_agent", skills=[*SKILL_SPEC.skills, anthropic_skill("xlsx")])
+
+
+def test_cma_runner_approves_reads_inside_an_anthropic_managed_skill():
+    """The server mounts Anthropic skills itself: the runner approves calls that stay inside one the agent has,
+    records the server's result, and still denies a skill the agent does not have."""
+    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
+    remote = {"/mnt/skills/public/xlsx/SKILL.md": "---\nname: xlsx\ndescription: Spreadsheets.\n---\nUse openpyxl."}
+    client = FakeCMAClient(
+        script=[{"tool": "read", "args": {"file_path": "/mnt/skills/public/xlsx/SKILL.md"}},
+                {"tool": "read", "args": {"file_path": "/mnt/skills/public/pptx/SKILL.md"}}, {"text": "ok"}],
+        spec=XLSX_SPEC, remote_files=remote)
+    r = ClaudeManagedRunner(XLSX_SPEC, record, client=client).run("go")
+    assert [e["result"] for e in client.sent if e["type"] == "user.tool_confirmation"] == ["allow", "deny"]
+    assert r.tool_calls[0].output.startswith("     1\t---") and r.tool_calls[0].is_error is False  # the server's rendering
+    assert r.tool_calls[1].is_error is True and "not inside a skill folder" in r.tool_calls[1].output
+    assert r.metadata["skills_used"] == ["xlsx"] and r.metadata["skill_root"] == "/mnt/skills/public"
+    assert r.output == "ok" and r.error is None
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_tool_calls_carry_the_error_flag_on_every_target(target, make_runner):
+    """Besides the same error text, every target marks which calls failed, so skills_used and future
+    tool_errors expectations never mistake a refused read for a successful one."""
+    script = [{"calls": [BOOK_CALL, {"tool": "boom", "args": {"reason": "x"}}, {"tool": "nope", "args": {}}]}, {"text": "ok"}]
+    r = make_runner(target, script, PARITY_SPEC, SELF_REF).run("go")
+    assert [(c.name, c.is_error) for c in r.tool_calls] == [("book", False), ("boom", True), ("nope", True)]
+
+
+def test_parallel_server_run_builtins_are_one_round_like_one_ai_message():
+    """Under an auto policy the server runs a message's calls itself. One model message is still one round, as in
+    the graph, whether the results follow the message or interleave with its calls: the span events delimit it."""
+    from types import SimpleNamespace
+
+    from tests.fakes import _idle, _tool_result
+
+    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
+    two_reads = {"calls": [READ_SKILL, READ_NOTES]}
+    client = FakeCMAClient(script=[two_reads, two_reads, {"text": "done"}], spec=SKILL_SPEC, builtin_permission="allow")
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error is None and r.output == "done" and [c.name for c in r.tool_calls] == ["read"] * 4
+    assert all(c.output and not c.is_error for c in r.tool_calls)
+
+    client = FakeCMAClient(script=[two_reads] * 3 + [{"text": "never"}], spec=SKILL_SPEC, builtin_permission="allow")
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error == iteration_limit_error(2) and len(r.tool_calls) == 6  # the third message is the round past the cap
+
+    # Results interleaved with the calls of the same message (a server that executes as it streams).
+    client = FakeCMAClient(script=[], spec=SKILL_SPEC, builtin_permission="allow")
+    for _ in range(2):
+        client._pending.append(SimpleNamespace(type="span.model_request_start"))
+        for args in (READ_SKILL["args"], READ_NOTES["args"]):
+            ev_id = f"sevt_{len(client._pending)}"
+            client._pending.append(SimpleNamespace(type="agent.tool_use", id=ev_id, name="read", input=args,
+                                                   evaluated_permission="allow", evaluation=SimpleNamespace(type="always_allow")))
+            client._pending.append(_tool_result(ev_id, *client._execute_builtin("read", dict(args))))
+        client._pending.append(SimpleNamespace(type="span.model_request_end"))
+    client._pending.append(SimpleNamespace(type="span.model_request_start"))
+    client._pending.append(SimpleNamespace(type="agent.message", content=[SimpleNamespace(type="text", text="done")]))
+    client._pending.append(SimpleNamespace(type="span.model_request_end"))
+    client._pending.append(_idle("end_turn"))
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error is None and r.output == "done" and len(r.tool_calls) == 4

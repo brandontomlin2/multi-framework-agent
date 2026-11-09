@@ -27,7 +27,8 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from mfa.runtime.result import AgentResult, ToolCall
-from mfa.spec import AgentSpec, iteration_limit_error, unknown_tool_error
+from mfa.skills import skills_prompt_block, skills_used
+from mfa.spec import AgentSpec, ToolSpec, iteration_limit_error, unknown_tool_error
 
 
 def recursion_limit_for(max_iterations: int) -> int:
@@ -69,11 +70,28 @@ def iteration_cap_route(spec: AgentSpec, *, tools_node: str = "tools") -> Callab
     return route
 
 
+def spec_tools(spec: AgentSpec) -> list[Any]:
+    """The LangChain tools a graph binds for a spec: the agent's own plus the skill file tools.
+
+    Custom ``graph_builder`` functions should bind these instead of ``spec.tools``
+    so skills work for them too.
+    """
+    return [t.to_langchain() for t in spec.runtime_tools()]
+
+
+def system_prompt_for(spec: AgentSpec) -> str:
+    """The spec's prompt plus the skills listing (name, description, location) when it has skills."""
+    block = skills_prompt_block(spec)
+    return f"{spec.system_prompt.rstrip()}\n\n{block}" if block else spec.system_prompt
+
+
 def build_graph(spec: AgentSpec, model: BaseChatModel, *, checkpointer: Any | None = None):
-    lc_tools = [t.to_langchain() for t in spec.tools]
+    tools: list[ToolSpec] = spec.runtime_tools()
+    by_name = {t.name: t for t in tools}
+    lc_tools = [t.to_langchain() for t in tools]
     bound = model.bind_tools(lc_tools) if lc_tools else model
-    system = SystemMessage(content=spec.system_prompt)
-    names = [t.name for t in spec.tools]
+    system = SystemMessage(content=system_prompt_for(spec))
+    names = list(by_name)
 
     def call_model(state: MessagesState) -> dict:
         return {"messages": [bound.invoke([system, *state["messages"]])]}
@@ -82,10 +100,10 @@ def build_graph(spec: AgentSpec, model: BaseChatModel, *, checkpointer: Any | No
         # Every target hands the model the text *and* the error flag ToolSpec.run
         # produced; the Claude Managed Agents runner sends the same pair as
         # user.custom_tool_result(is_error=...).
-        if tc["name"] not in names:
+        if tc["name"] not in by_name:
             text, is_error = unknown_tool_error(tc["name"], names), True
         else:
-            text, is_error = spec.tool_by_name(tc["name"]).run(dict(tc["args"]))
+            text, is_error = by_name[tc["name"]].run(dict(tc["args"]))
         return ToolMessage(
             content=text, name=tc["name"], tool_call_id=tc["id"], status="error" if is_error else "success"
         )
@@ -131,16 +149,19 @@ def _text(message: BaseMessage) -> str:
 def extract_result(messages: list[BaseMessage], *, target: str, user_input: str) -> AgentResult:
     """Convert the messages produced by one turn into the shared AgentResult shape."""
     outputs: dict[str, str] = {}
+    errors: dict[str, bool] = {}
     for m in messages:
         if isinstance(m, ToolMessage):
             outputs[m.tool_call_id] = m.content if isinstance(m.content, str) else json.dumps(m.content)
+            errors[m.tool_call_id] = getattr(m, "status", "success") == "error"
 
     calls: list[ToolCall] = []
     final = ""
     for m in messages:
         if isinstance(m, AIMessage):
             for tc in m.tool_calls:
-                calls.append(ToolCall(name=tc["name"], args=tc["args"], output=outputs.get(tc["id"])))
+                calls.append(ToolCall(name=tc["name"], args=tc["args"], output=outputs.get(tc["id"]),
+                                      is_error=errors.get(tc["id"], False)))
             text = _text(m)
             if text:
                 final = text
@@ -248,6 +269,8 @@ def run_turn(graph, user_input: str, *, thread_id: str, target: str, max_iterati
     result.error = error
     result.latency_s = round(time.monotonic() - start, 3)
     result.metadata["thread_id"] = thread_id
+    if used := skills_used(result.tool_calls):
+        result.metadata["skills_used"] = used
     if pending:
         result.metadata["pending_nodes"] = list(pending)  # e.g. a custom graph waiting at interrupt_before
     return result

@@ -18,7 +18,7 @@ class LocalRunner:
         self.spec = spec
         self.model = spec.model_for(LOCAL, model)
         # chat_model lets tests (or callers) inject any LangChain chat model.
-        self.graph = build_agent_graph(spec, chat_model or make_chat_model(self.model))
+        self.graph = build_agent_graph(spec, chat_model or make_chat_model(self.model, effort=spec.effort))
 
     def run(self, user_input: str, *, thread_id: str | None = None) -> AgentResult:
         result = run_turn(
@@ -37,7 +37,7 @@ class LocalTarget:
 
     def deploy(self, spec: AgentSpec, *, model: str | None = None, **options: Any) -> dict[str, Any]:
         # Nothing to provision: building the graph validates the spec.
-        build_agent_graph(spec, make_chat_model(spec.model_for(LOCAL, model)))
+        build_agent_graph(spec, make_chat_model(spec.model_for(LOCAL, model), effort=spec.effort))
         return {"target": LOCAL, "model": spec.model_for(LOCAL, model)}
 
     def runner(self, spec: AgentSpec, *, model: str | None = None, **options: Any) -> LocalRunner:

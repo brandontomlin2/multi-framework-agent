@@ -9,7 +9,7 @@
 
 from pathlib import Path
 
-from mfa import AGENT_ENGINE, CLAUDE_MANAGED, LOCAL, AgentSpec
+from mfa import AGENT_ENGINE, CLAUDE_MANAGED, LOCAL, AgentSpec  # , local_skills
 
 from agents._template.tools import TOOLS
 
@@ -24,4 +24,6 @@ AGENT = AgentSpec(
         CLAUDE_MANAGED: "claude-opus-5-5",
     },
     eval_dataset=str(Path(__file__).parent / "evals" / "cases.yaml"),
+    # Agent Skills (folders with a SKILL.md under skills/): uncomment to attach them.
+    # skills=local_skills(Path(__file__).parent / "skills"),
 )

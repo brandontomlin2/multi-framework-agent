@@ -32,7 +32,8 @@ where = ["src", "."]
 include = ["mfa*", "agents*"]
 
 [tool.setuptools.package-data]
-"*" = ["*.yaml", "*.json"]
+# eval datasets, deployment configs and Agent Skills (SKILL.md, references, scripts, assets)
+"*" = ["*.yaml", "*.json", "*.md", "*.txt", "skills/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -30,7 +30,7 @@ class LangGraphAgentApp:
         # InMemorySaver keeps threads per serving instance. For durable
         # multi-turn state across instances, pass a persistent checkpointer
         # (e.g. AlloyDB / Cloud SQL / Firestore) here.
-        self._graph = build_agent_graph(self._spec, make_chat_model(self.model))
+        self._graph = build_agent_graph(self._spec, make_chat_model(self.model, effort=self._spec.effort))
 
     def query(self, *, input: str, thread_id: str | None = None) -> dict[str, Any]:
         """Run one user turn. Returns an ``AgentResult`` as a plain dict."""

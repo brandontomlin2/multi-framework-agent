@@ -26,18 +26,13 @@ SCRIPT = [
 ]
 
 
-@pytest.fixture(autouse=True)
-def _tmp_deployments(tmp_path, monkeypatch):
-    monkeypatch.setattr(deployments, "DEFAULT_DIR", tmp_path / ".deployments")
-
-
 @pytest.fixture
 def client(monkeypatch):
     from mfa.serving import load_root_agent
 
     load_root_agent.cache_clear()
     monkeypatch.setenv("MFA_MODEL", "x:y")
-    monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=SCRIPT * 5))
+    monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m, **kw: ScriptedChatModel(script=SCRIPT * 5))
     from mfa.serving.fast_api_app import create_app
 
     yield TestClient(create_app())
@@ -57,7 +52,8 @@ def test_serving_query_returns_normalized_result(client):
 
 def test_a2a_card_and_message_send(client):
     card = client.get("/a2a/app/.well-known/agent-card.json").json()
-    assert {s["id"] for s in card["skills"]} == {t.name for t in SPEC.tools}
+    assert {s["id"] for s in card["skills"]} == {t.name for t in SPEC.tools} | {f"skill:{sk.name}" for sk in SPEC.skills}
+    assert client.get("/health").json()["skills"] == ["weather-briefing"]
     resp = client.post("/a2a/app", json={
         "jsonrpc": "2.0", "id": 1, "method": "message/send",
         "params": {"message": {"kind": "message", "messageId": "m1", "role": "user",
@@ -98,7 +94,9 @@ def test_cloud_run_runner_against_served_app(client, monkeypatch):
 
 def test_container_context_follows_agents_cli_contract(tmp_path):
     out = build_context(SPEC, "anthropic:claude-opus-5-5", tmp_path / "ctx")
-    for f in ["app/agent.py", "app/fast_api_app.py", "Dockerfile", "requirements.txt", "agents/weather_agent/agent.py"]:
+    for f in ["app/agent.py", "app/fast_api_app.py", "Dockerfile", "requirements.txt", "agents/weather_agent/agent.py",
+              "agents/weather_agent/skills/weather-briefing/SKILL.md",
+              "agents/weather_agent/skills/weather-briefing/references/clothing-guide.md"]:
         assert (out / f).exists(), f
     assert "uvicorn app.fast_api_app:app" in (out / "Dockerfile").read_text()
     reqs = (out / "requirements.txt").read_text()
@@ -124,14 +122,18 @@ def test_cma_deploy_reuses_existing_environment_by_name():
 
 
 def test_cma_ant_files_and_register(tmp_path):
-    agent_md, env_yaml = write_ant_files(SPEC, "claude-opus-5-5", tmp_path)
+    agent_md, env_yaml, *skill_files = write_ant_files(SPEC, "claude-opus-5-5", tmp_path)
     text = agent_md.read_text()
     front, body = text.split("---\n")[1], text.split("---\n", 2)[2]
     cfg = yaml.safe_load(front)
     assert cfg["model"] == {"id": "claude-opus-5-5"} and "system" not in cfg
-    assert [t["name"] for t in cfg["tools"]] == [t.name for t in SPEC.tools]
+    assert [t["name"] for t in cfg["tools"] if t["type"] == "custom"] == [t.name for t in SPEC.tools]
+    assert cfg["tools"][0]["type"] == "agent_toolset_20260401"
+    assert cfg["skills"] == [{"type": "custom", "skill_id": "<uploaded at deploy: weather-briefing>"}]
     assert body.strip() == SPEC.system_prompt.strip()
     assert yaml.safe_load(env_yaml.read_text())["config"]["networking"]["type"] == "limited"
+    # The skill folder travels with the files for ant apply / the Skills API.
+    assert (agent_md.parent / "skills" / "weather-briefing" / "SKILL.md").exists()
 
     rec = register(SPEC, "agent_x", "env_y", client=FakeCMAClient())
     assert rec["agent_version"] == 7 and deployments.load(SPEC.name, CLAUDE_MANAGED)["agent_id"] == "agent_x"
@@ -179,7 +181,7 @@ def test_a2a_route_applies_spec_iteration_limit(monkeypatch):
     monkeypatch.setattr(SPEC, "max_iterations", 2)
     monkeypatch.setenv("MFA_MODEL", "x:y")
     looping = [{"tool": "get_weather_today", "args": {"location": "Paris"}}] * 10 + [{"text": "FINAL"}]
-    monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=looping))
+    monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m, **kw: ScriptedChatModel(script=looping))
     from mfa.serving.fast_api_app import create_app
 
     try:
@@ -203,7 +205,7 @@ def test_a2a_reply_is_the_final_message_like_mfa_query(monkeypatch):
     load_root_agent.cache_clear()
     monkeypatch.setenv("MFA_MODEL", "x:y")
     script = [{"text": "Let me check.", "tool": "get_weather_today", "args": {"location": "Paris"}}, {"text": "Sunny in Paris."}] * 2
-    monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m: ScriptedChatModel(script=script))
+    monkeypatch.setattr("mfa.runtime.models.make_chat_model", lambda m, **kw: ScriptedChatModel(script=script))
     from mfa.serving.fast_api_app import create_app
 
     try:

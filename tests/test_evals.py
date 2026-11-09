@@ -25,10 +25,15 @@ def test_shared_dataset_is_valid():
     spec = load_agent("weather_agent")
     cases = load_cases(spec.eval_dataset)
     assert len(cases) >= 10
-    tool_names = {t.name for t in spec.tools}
+    tool_names = set(spec.runtime_tool_names())  # the agent's tools plus the skill file tools
+    skill_names = {sk.name for sk in spec.skills}
     for c in cases:
-        for name in [*c.expect.tools_called, *c.expect.tools_not_called, *c.expect.tool_args, *c.expect.tool_args_contain]:
+        for name in [*c.expect.tools_called, *c.expect.tools_not_called, *c.expect.tool_args, *c.expect.tool_args_contain,
+                     *(e.tool for e in c.expect.tool_calls)]:
             assert name in tool_names, f"{c.id} references unknown tool {name}"
+        for name in [*c.expect.skills_used, *c.expect.skills_not_used]:
+            assert name in skill_names, f"{c.id} references unknown skill {name}"
+    assert [c.id for c in load_cases(spec.eval_dataset, tags=["skill"])]
     assert load_cases(spec.eval_dataset, tags=["smoke"])
     assert [c.id for c in load_cases(spec.eval_dataset, ids=["asks_for_location"])] == ["asks_for_location"]
 
@@ -197,3 +202,57 @@ def test_cli_gate_fails_on_ungraded_checks_only_when_gated(monkeypatch, tmp_path
     assert cli.main([*base, "--min-pass-rate", "0.5"]) == 1  # gated run: an ungraded check is not a pass
     assert "could not be graded" in capsys.readouterr().err
     assert cli.main([*base, "--min-pass-rate", "0.5", "--allow-ungraded"]) == 0
+
+
+def test_skill_checks_look_at_which_skill_md_was_read():
+    exp = {"skills_used": ["weather-briefing"], "skills_not_used": ["other-skill"]}
+    case = EvalCase.model_validate({"id": "s", "input": "q", "expect": exp})
+    used = AgentResult(target="t", input="q", output="ok", tool_calls=[
+        ToolCall(name="read", args={"file_path": "/mnt/anywhere/weather-briefing/SKILL.md"})])
+    assert {c.name: c.passed for c in deterministic_checks(case.expect, used)}.items() >= {
+        "skill:weather-briefing": True, "skill_not:other-skill": True}.items()
+    wrong = AgentResult(target="t", input="q", output="ok", tool_calls=[
+        ToolCall(name="read", args={"file_path": "other-skill/SKILL.md"})])
+    assert {c.name: c.passed for c in deterministic_checks(case.expect, wrong)}.items() >= {
+        "skill:weather-briefing": False, "skill_not:other-skill": False}.items()
+
+
+def test_tool_calls_expectation_needs_distinct_matching_calls():
+    exp = {"tool_calls": [{"tool": "w", "args_contain": {"location": "paris"}}, {"tool": "w", "args_contain": {"location": "tokyo"}}]}
+    case = EvalCase.model_validate({"id": "p", "input": "q", "expect": exp})
+    both = AgentResult(target="t", input="q", output="", tool_calls=[
+        ToolCall(name="w", args={"location": "Paris, France"}), ToolCall(name="w", args={"location": "Tokyo"})])
+    assert all(c.passed for c in deterministic_checks(case.expect, both) if c.name.startswith("call["))
+    twice_paris = AgentResult(target="t", input="q", output="", tool_calls=[
+        ToolCall(name="w", args={"location": "Paris"}), ToolCall(name="w", args={"location": "Paris"})])
+    names = {c.name: c.passed for c in deterministic_checks(case.expect, twice_paris)}
+    assert names["call[0]:w"] is True and names["call[1]:w"] is False  # the same call cannot satisfy both
+
+
+def test_args_contain_reaches_nested_arguments_and_sequence_is_ordered():
+    from mfa.evals.dataset import Expectations, ExpectedCall
+    from mfa.evals.graders import deterministic_checks
+    from mfa.runtime.result import AgentResult, ToolCall
+
+    result = AgentResult(target="local", input="i", output="o", tool_calls=[
+        ToolCall(name="lookup_order", args={"order_id": ""}),
+        ToolCall(name="search_products", args={"query": "Running shoes", "filters": {"category": "shoes", "sizes": ["9", "10"], "max_price": 100.0}, "page": 1}),
+        ToolCall(name="start_return", args={"order_id": "ORD-1001", "sku": "SH-RUN-9", "reason": "too_small"}),
+    ])
+    exp = Expectations(
+        tool_args_contain={"search_products": {"filters.category": "shoes", "filters.sizes": ["10"], "filters.max_price": 100, "query": "running"}},
+        tool_calls=[ExpectedCall(tool="lookup_order", args={"order_id": ""}),
+                    ExpectedCall(tool="search_products", args_contain={"filters": {"sizes": ["9", "10"]}, "page": 1})],
+        tool_sequence=["lookup_order", "start_return"],
+    )
+    checks = {c.name: c for c in deterministic_checks(exp, result)}
+    assert all(c.passed for c in checks.values()), {n: c.detail for n, c in checks.items() if not c.passed}
+
+    wrong = Expectations(
+        tool_args_contain={"search_products": {"filters.sizes": ["11"], "filters.max_price": 99}},
+        tool_sequence=["start_return", "lookup_order"],
+        tool_calls=[ExpectedCall(tool="search_products", args_contain={"filters.category": "apparel"})],
+    )
+    checks = {c.name: c for c in deterministic_checks(wrong, result)}
+    assert checks["args_contain:search_products"].passed is False and checks["sequence"].passed is False
+    assert checks["call[0]:search_products"].passed is False
