@@ -1,6 +1,6 @@
 # Hand-off: multi-framework-agent
 
-_Last updated 2026-11-08. The README explains the design; this document is the state of the project, what has been verified where, and what to do next._
+_Last updated 2026-11-09. The README explains the design; this document is the state of the project, what has been verified where, and what to do next._
 
 ## 1. What this repository is
 
@@ -26,7 +26,7 @@ If you change any of these, extend `tests/test_parity.py` first; it is the contr
 ## 3. Verified state
 
 ### Offline (every commit)
-`scripts/ci.sh` = fresh venv, `pip install -e ".[all]"`, `pytest -q`. **118 tests pass.** GitHub Actions (`ci.yml`) calls the same script but **jobs never start on this account** (Actions billing / spending limit; jobs show `runner_id: 0` and no logs). Until that is fixed in GitHub → Settings → Billing & plans, `scripts/ci.sh` is the CI.
+`scripts/ci.sh` = fresh venv, `pip install -e ".[all]"`, `pytest -q`. **133 tests pass.** GitHub Actions (`ci.yml`) calls the same script but **jobs never start on this account** (Actions billing / spending limit; jobs show `runner_id: 0` and no logs). Until that is fixed in GitHub → Settings → Billing & plans, `scripts/ci.sh` is the CI.
 
 ### Live, Claude Managed Agents (2026-11-08)
 - Agent `agent_01SD7xCKD87TXdWKDtrk3qji`, **version 2**, environment `env_01SVkmJeYVcPRMU3BhAQCvGd` (`weather_agent-env`, cloud, `limited` networking, no hosts).
@@ -38,6 +38,13 @@ If you change any of these, extend `tests/test_parity.py` first; it is the contr
 - The deployment record `.deployments/weather_agent.claude_managed.json` is gitignored and lived only in the sandbox that ran the deploy. Recreate it with  
   `mfa register weather_agent -t claude_managed --agent-id agent_01SD7xCKD87TXdWKDtrk3qji --environment-id env_01SVkmJeYVcPRMU3BhAQCvGd`  
   then `mfa deploy weather_agent -t claude_managed` to bring the skill ids into the record: it matches the attached custom skills by display name and uploads a new version of each (the attached content is unknown to it); later deploys re-upload only when content changes.
+
+### Live, Claude Managed Agents, `order_support_agent` (2026-11-09)
+
+- Agent `agent_01LLDMvbh1CoaZ4QVR6x8q5r`, **version 1**, environment `env_01NPvJrZ2bgvCYNU7oqc74hM` (`order_support_agent-env`), skill `returns-policy` uploaded as `skill_01Fb3UTb4nRAiJtXUjXYpbns` / `skver_01M8LBtqyMGJZsJyhARzrRSd`, toolset `read`/`glob`/`grep` under `always_ask`. Re-register with  
+  `mfa register order_support_agent -t claude_managed --agent-id agent_01LLDMvbh1CoaZ4QVR6x8q5r --environment-id env_01NPvJrZ2bgvCYNU7oqc74hM` then `mfa deploy order_support_agent -t claude_managed`.
+- Full suite, 17 cases, Claude judge, fixture store (the only store): **17/17 on `claude_managed`** and **16/17 on `local`** in the same run (p50 latency 6.8 s vs 4.5 s); the one miss was an over-strict check, not the agent (it quoted the injected gift message verbatim while refusing to act on it; the check forbade the quoted marker). After correcting that check the case passes on both targets. The first run had scored 13/17 and 14/17 for the same reason: four expectations were too literal (a `page: 1` the model leaves at its default, a wrong product on page 2, an en dash in "6–10 business days", a return the agent correctly refused from the policy without calling `start_return`). Lesson: let deterministic checks assert tool calls and key facts, and leave phrasing to the judge.
+- Every target handled the three-call message mixing a skill read with two custom calls, the two-step return (`start_return` → ask → `confirm_return` only after "yes"), the pending ticket flipping to approved on the second poll, the nested `ProductFilters`/`Address` arguments (the model sometimes sends sizes as numbers; the tool coerces), and the injected gift message (reported, never obeyed).
 
 ### Not yet run live
 - `cloud_run` and `agent_engine`: no GCP credentials have been available. Deploy paths are covered by offline tests only (`tests/test_serving_and_exports.py`, `tests/test_targets.py`). First live checks to do: the container builds and serves `/health`, `/mfa/query` and the A2A card; Agent Runtime ships non-`.py` files (`SKILL.md`, references) with `extra_packages`; `ChatVertexAI(thinking_budget=...)` is accepted for the effort mapping.
@@ -80,9 +87,9 @@ If you change any of these, extend `tests/test_parity.py` first; it is the contr
 
 ## 8. Expanding the example agents
 
-The weather agent now has 19 eval cases: location handling, units, ambiguity, unknown places, scope guards, prompt injection, the `weather-briefing` skill (what to wear / umbrella / day plan), parallel calls for two cities, a correction in a follow-up turn, shouted input, and two questions answered by one call. The eval format gained `tool_calls` (distinct calls to one tool with different arguments) for the parallel case.
+Two example agents now exist. `weather_agent` (19 cases) covers the basics: location handling, units, ambiguity, unknown places, scope guards, prompt injection in the user message, the `weather-briefing` skill, parallel calls for two cities, a correction in a follow-up turn, shouted input, two questions answered by one call. `order_support_agent` (17 cases, added 2026-11-09 from the catalogue's first recommendation) covers what real agents do: a sentinel argument, nested and enum arguments, pagination, a two-step mutation that waits for the customer's explicit confirmation, a pending ticket to poll, policy decisions explained from the `returns-policy` skill, injected text inside a tool result, a Spanish-language turn, and a fixture store with `MFA_ORDERS_FAULTS` for fault injection. The eval format gained `tool_calls` (distinct calls to one tool), containment semantics with dotted paths for `args_contain` (nested arguments) and `tool_sequence` (ordered calls) along the way; tool specs inline nested argument models so every provider gets a self-contained JSON Schema.
 
-`docs/EDGE_CASES.md` is the catalogue of 23 edge cases derived from Google's agent samples (status in this template, proposal, difficulty), the eval-format gaps against agents-cli and ADK evalsets, and three fully specified next example agents (`order_support_agent`, `docs_research_agent`, `expense_approvals_agent`) with eval ideas; `docs/research/google-agent-samples-2026-11-08.md` is the raw survey with per-sample evidence. Start with the cheap format additions in its §5, then `order_support_agent`. When adding one: copy `agents/_template`, keep tools pure and fixture-backed so the suite stays offline, add a skill if the agent needs procedural knowledge, write cases with `tool_calls`/`skills_used` expectations, and extend `tests/test_parity.py` only when the agent exercises a behaviour the contract does not cover yet.
+`docs/EDGE_CASES.md` is the catalogue of 23 edge cases derived from Google's agent samples (status in this template, proposal, difficulty), the eval-format gaps against agents-cli and ADK evalsets, and the remaining recommended agents (`docs_research_agent` for structured output, large tool results and citations; `expense_approvals_agent` for nested models with dates, pending approvals and references), with eval ideas; `docs/research/google-agent-samples-2026-11-08.md` is the raw survey. Next in order: per-turn expectations (#8), then `docs_research_agent`. When adding an agent: copy `agents/_template` (or `agents/order_support_agent` for a richer start), keep tools pure and fixture-backed so the suite stays offline, add a skill if the agent needs procedural knowledge, write cases with `tool_calls`/`tool_sequence`/`skills_used` expectations and a judge rubric for phrasing, run the suite live on `local` and `claude_managed` before trusting a case (expect one or two expectations to be too literal on the first pass), and extend `tests/test_parity.py` only when the agent exercises a behaviour the contract does not cover yet.
 
 ## 9. Conventions
 
