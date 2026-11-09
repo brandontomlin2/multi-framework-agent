@@ -35,6 +35,8 @@ Write an agent once in **LangGraph** style: a prompt, some typed Python tools, a
 ```
 agents/weather_agent/        worked example: today's weather, asks where if you don't say; 19 eval cases
   skills/weather-briefing/   an Agent Skill (SKILL.md + references/ + scripts/) the agent reads on demand
+agents/order_support_agent/  worked example 2: orders, returns with confirmation, shipping, product search; 17 eval cases
+  skills/returns-policy/     the return policy and procedure the agent follows
 agents/_template/            copy this to start a new agent
 src/mfa/
   spec.py                    AgentSpec / ToolSpec / SkillSpec, @tool, skill(), local_skills(): the framework-neutral definition
@@ -119,7 +121,7 @@ agents-cli eval grade --traces traces.json --config eval_config.yaml
 
 Deploy records live in `.deployments/<agent>.<target>.json`: the Agent Runtime resource name, the Cloud Run URL and A2A card URL, or the CMA agent ID, version and environment. Redeploying updates the same resource. They hold no secrets. Commit them, by removing `.deployments/` from `.gitignore`, if CI or teammates evaluate the same deployments. With `ant apply`, also commit `claude-lock.json`.
 
-## The example agent
+## The example agents
 
 `weather_agent` has one tool, `get_weather_today(location)`. It returns today's conditions, the current temperature, today's high and low, and the chance of precipitation, in °F and °C, plus other places with the same name when the name is ambiguous. If the user doesn't say where, the agent asks before calling the tool, and it uses a place given in a later turn.
 
@@ -132,6 +134,18 @@ Weather data comes from `MFA_WEATHER_PROVIDER`:
 - `fixture`: deterministic offline data for Seattle, Paris, Tokyo, London and Portland. The tests always use it. For a fully reproducible eval run, set it where the tool runs: in your shell for `local` and `claude_managed`, and with `MFA_FORWARD_ENV=MFA_WEATHER_PROVIDER` at deploy time for the Gemini targets (`MFA_FORWARD_ENV` copies any listed env vars into the deployed container).
 
 Because live weather changes, the eval cases never assert specific temperatures. The deterministic checks cover behaviour (did it ask where, did it call the tool with the right place, did it report temperatures and units), and the judge checks that the reply matches the tool output it saw.
+
+### `order_support_agent`
+
+The second example is order support for one signed-in customer of a fictional outdoor-gear shop, built to exercise what real agents do (the catalogue in `docs/EDGE_CASES.md`):
+
+- **Argument shapes.** `lookup_order(order_id="")`, where the empty string means the latest order; `search_products(query, filters, page)` with a nested `ProductFilters` model (an enum category, a list of sizes, a maximum price) and pages of three; `start_return(order_id, sku, reason)` with an enum reason; `shipping_estimate(destination, skus)` with a nested `Address`. Nested models are inlined into each tool's JSON Schema, so every provider gets a self-contained schema.
+- **A two-step mutation.** `start_return` checks the policy and returns either a refund estimate with a confirmation token or a rejection with alternatives (window closed, final sale, not delivered yet). The agent must summarise and ask, and may call `confirm_return` only after the customer agrees in a later turn. `confirm_return` opens a pending ticket; `check_return` reports `pending` once and `approved` with a label link (a reference, never file bytes) after that.
+- **Policy from a skill.** `skills/returns-policy/` holds the procedure and `references/policy.md` the rules, so the agent explains decisions in the policy's words while the tools enforce them.
+- **Data that must stay data.** One order's gift message carries an injected instruction; the suite checks that it is reported, not obeyed.
+- **A deterministic store.** `orders.py` is a fixture clocked to 2026-11-09 (an order system has no public API to call), so every case is reproducible offline on every target; `MFA_ORDERS_FAULTS=lookup_order,...` makes the named tools raise, for error-path experiments.
+
+Its 17 cases use the newer expectations: `tool_calls` with dotted `args_contain` into nested arguments, `tool_sequence` for the order of calls, `skills_used`, and multi-turn cases for pagination ("show me more"), the confirmation flow and the pending ticket, plus a Spanish-language case and an out-of-scope case.
 
 ## The turn contract (what every target guarantees)
 
@@ -221,7 +235,7 @@ cases:
     turns: ["What's the weather today?", "Tokyo"]       # multi-turn
     expect:
       tools_called: [get_weather_today]                  # trajectory checks
-      tool_args_contain: {get_weather_today: {location: tokyo}}   # substring; tool_args = exact
+      tool_args_contain: {get_weather_today: {location: tokyo}}   # containment; tool_args = exact
       max_tool_calls: 1
       output_contains: ["Tokyo"]                         # output checks (case-insensitive)
       output_regex: "\\d+ ?°"
@@ -234,6 +248,8 @@ cases:
 - **Environment:** every report records the non-secret `MFA_*` variables in effect (for example `MFA_WEATHER_PROVIDER`), so a cross-target difference can be traced to data, not only to the platform.
 - **Skills:** `skills_used: [name]` passes when the skill's `SKILL.md` was read during the case (any root, any target); `skills_not_used` is the opposite. Tool expectations may name the skill tools (`read`, `glob`, `grep`, `bash`) like any other tool.
 - **Several calls to one tool:** `tool_calls: [{tool, args | args_contain}, ...]` requires a distinct matching call for every entry (two cities asked in one message, a correction in a later turn), which `tool_args` alone cannot express.
+- **Nested arguments:** `tool_args_contain` and `args_contain` mean containment: a case-insensitive substring for strings, a subset for lists, equality for numbers and booleans; dotted keys reach into nested arguments (`"filters.category": shoes`, `"destination.postal_code": "75001"`).
+- **Order of calls:** `tool_sequence: [lookup_order, start_return, confirm_return]` passes when those calls happen in that order, with any other calls allowed in between.
 - **Reports:** `eval_results/<agent>/<target>-<timestamp>.{json,md}` record per-case checks, per-turn tool trajectories, latency, and CMA session IDs (which you can open in the Console session viewer).
 - **Gemini format:** `mfa export -t gemini_eval` converts any report, from any target, into the Gemini platform `EvaluationDataset` shape (`eval_cases[].agent_data.turns[].events[]`, with `function_call` / `function_response` parts). The rubric and mfa's own checks travel as extra fields for custom metrics.
 
