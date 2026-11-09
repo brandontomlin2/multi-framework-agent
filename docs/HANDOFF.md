@@ -26,7 +26,7 @@ If you change any of these, extend `tests/test_parity.py` first; it is the contr
 ## 3. Verified state
 
 ### Offline (every commit)
-`scripts/ci.sh` = fresh venv, `pip install -e ".[all]"`, `pytest -q`. **133 tests pass.** GitHub Actions (`ci.yml`) calls the same script but **jobs never start on this account** (Actions billing / spending limit; jobs show `runner_id: 0` and no logs). Until that is fixed in GitHub → Settings → Billing & plans, `scripts/ci.sh` is the CI.
+`scripts/ci.sh` = fresh venv, `pip install -e ".[all]"`, `pytest -q`. **133 tests pass.** GitHub Actions (`ci.yml`) calls the same script. From 2026-11-08 until early 2026-11-09 jobs never started on this account (Actions billing / spending limit: `runner_id: 0`, no logs), so PRs #1 and #2 were merged on the strength of `scripts/ci.sh`; the first green `test` run landed on 2026-11-09 on PR #3. If it happens again: GitHub → Settings → Billing & plans, and `scripts/ci.sh --post-status` posts the local result to the commit meanwhile.
 
 ### Live, Claude Managed Agents (2026-11-08)
 - Agent `agent_01SD7xCKD87TXdWKDtrk3qji`, **version 2**, environment `env_01SVkmJeYVcPRMU3BhAQCvGd` (`weather_agent-env`, cloud, `limited` networking, no hosts).
@@ -94,5 +94,5 @@ Two example agents now exist. `weather_agent` (19 cases) covers the basics: loca
 ## 9. Conventions
 
 - Commits carry the trailer lines used so far (see `git log`); PRs end with the Claude Code footer.
-- Every change to `src/mfa` runs `scripts/ci.sh` before a push; a red PR is this repository's own problem unless the job never started (billing).
+- Every change to `src/mfa` runs `scripts/ci.sh` before a push; a red PR is this repository's own problem unless the job never started (a job that ends within seconds with `runner_id: 0` is the account's Actions billing, not the code).
 - Deployment records (`.deployments/`) and eval results (`eval_results/`) are gitignored; commit them deliberately if a team shares deployments.
