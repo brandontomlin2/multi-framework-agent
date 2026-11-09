@@ -26,7 +26,7 @@ If you change any of these, extend `tests/test_parity.py` first; it is the contr
 ## 3. Verified state
 
 ### Offline (every commit)
-`scripts/ci.sh` = fresh venv, `pip install -e ".[all]"`, `pytest -q`. **106 tests pass.** GitHub Actions (`ci.yml`) calls the same script but **jobs never start on this account** (Actions billing / spending limit; jobs show `runner_id: 0` and no logs). Until that is fixed in GitHub → Settings → Billing & plans, `scripts/ci.sh` is the CI.
+`scripts/ci.sh` = fresh venv, `pip install -e ".[all]"`, `pytest -q`. **118 tests pass.** GitHub Actions (`ci.yml`) calls the same script but **jobs never start on this account** (Actions billing / spending limit; jobs show `runner_id: 0` and no logs). Until that is fixed in GitHub → Settings → Billing & plans, `scripts/ci.sh` is the CI.
 
 ### Live, Claude Managed Agents (2026-11-08)
 - Agent `agent_01SD7xCKD87TXdWKDtrk3qji`, **version 2**, environment `env_01SVkmJeYVcPRMU3BhAQCvGd` (`weather_agent-env`, cloud, `limited` networking, no hosts).
@@ -66,6 +66,8 @@ If you change any of these, extend `tests/test_parity.py` first; it is the contr
 
 - **Architecture review (2026-11-08)**, 7 lenses + adversarial verification: 49 confirmed findings. Priorities 1 (behavioural parity) and 3 (eval trust) are done (PR #1). Still open: priority 2 **serving hot path** (bounded/shareable conversation state: `InMemorySaver` grows per request, multi-turn threads pinned to one replica, no `--session-affinity`/`--concurrency`, no request deadline on the async path), priority 4 **platform fit** (CMA custom tools cannot run unattended → an MCP tool mode served from the Cloud Run container; `/mfa/query` has no application-level auth and accepts any `thread_id`), priority 5 **deploy unit** (only `agents/` can be deployed, records are cwd-relative and never reconciled, `agent_engine.py`/`container.py` duplicate staging).
 - **Skills design panel + independent review (2026-11-08)**: implemented in PR #2; the review's seven findings (bash newline bypass, glob/grep without path, round counting for server-run built-ins, root-tied authorisation, unconfined glob, tautological CMA assertions, timeouts) are fixed.
+- **Review 3 (code review of PR #2, 2026-11-09):** ten findings, all fixed in one commit. The real ones: Anthropic-managed skills were denied on CMA because the sandbox only knew local folders (now approved when the call stays inside an attached skill the server mounts); rounds on CMA were closed by every tool result, splitting parallel server-run calls (now one model message = one round, delimited by the server's `span.model_request_start` events, confirmed on a live trace); `MFA_EFFORT` was ignored by the CMA translation; a deploy after `mfa register` would have created a duplicate skill; `skills_used` counted refused reads (every `ToolCall` now carries `is_error`); the weather client did not retry connection resets; the record misdescribed the toolset under `MFA_CMA_ENABLE_TOOLSET=1`; `MFA_EFFORT` typos crashed Gemini containers with a bare KeyError. Plus two cleanups (skill files read once per deploy, `mfa show` builds skill tools once).
+
 
 ## 7. Backlog (in the order I would do it)
 
