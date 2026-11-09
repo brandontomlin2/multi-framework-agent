@@ -12,8 +12,10 @@ YAML format::
           no_tool_calls: false
           tool_args:                             # exact (case-insensitive) match on some call's args
             get_weather_today: {location: Paris}
-          tool_args_contain:                     # substring match: "Paris, France" also passes
-            get_weather_today: {location: paris}
+          tool_args_contain:                     # containment: substring for strings, subset for lists,
+            get_weather_today: {location: paris}   # equality for numbers; "Paris, France" also passes
+          # dotted keys reach nested arguments: {"filters.category": shoes, "filters.sizes": ["9"]}
+          tool_sequence: [lookup_order, start_return]   # these calls happen in this order (others may come between)
           tool_calls:                            # distinct calls, e.g. two cities asked in one message
             - {tool: get_weather_today, args_contain: {location: paris}}
             - {tool: get_weather_today, args_contain: {location: tokyo}}
@@ -42,7 +44,8 @@ class Expectations(BaseModel):
     tools_not_called: list[str] = Field(default_factory=list)
     no_tool_calls: bool = False
     tool_args: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    tool_args_contain: dict[str, dict[str, str]] = Field(default_factory=dict)
+    tool_args_contain: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    tool_sequence: list[str] = Field(default_factory=list)  # an ordered subsequence of the tool names called
     max_tool_calls: int | None = None
     output_contains: list[str] = Field(default_factory=list)
     output_contains_any: list[str] = Field(default_factory=list)
@@ -58,7 +61,7 @@ class Expectations(BaseModel):
 class ExpectedCall(BaseModel):
     tool: str
     args: dict[str, Any] = Field(default_factory=dict)
-    args_contain: dict[str, str] = Field(default_factory=dict)
+    args_contain: dict[str, Any] = Field(default_factory=dict)
 
 
 class EvalCase(BaseModel):

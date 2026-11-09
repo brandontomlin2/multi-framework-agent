@@ -92,7 +92,7 @@ class ToolSpec:
         # LangChain derives a JSON schema from type hints + a Google-style
         # docstring; we reuse it so there is exactly one schema per tool.
         lc_tool = StructuredTool.from_function(func, parse_docstring=True)
-        schema = lc_tool.args_schema.model_json_schema()
+        schema = inline_refs(lc_tool.args_schema.model_json_schema())
         schema.pop("title", None)
         schema.pop("description", None)
         for prop in schema.get("properties", {}).values():
@@ -138,6 +138,41 @@ class ToolSpec:
             args_schema=self.input_schema,
             func=lambda **kwargs: self.invoke(kwargs),
         )
+
+
+def inline_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    """Replace ``$ref`` pointers into ``$defs`` with the definitions themselves (nested argument models).
+
+    Every provider accepts a self-contained JSON Schema; not every one follows
+    ``$ref``. Recursive models are left as they are.
+    """
+    defs = schema.get("$defs") or {}
+
+    def expand(node: Any, seen: tuple[str, ...], in_properties: bool = False) -> Any:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                name = ref[len("#/$defs/"):]
+                if name in defs and name not in seen:
+                    target = dict(defs[name])
+                    target.pop("title", None)
+                    merged = {**target, **{k: v for k, v in node.items() if k != "$ref"}}
+                    return expand(merged, (*seen, name))
+                return node
+            out = {}
+            for k, v in node.items():
+                if k == "$defs" or (k == "title" and not in_properties and seen):
+                    continue  # pydantic's field titles add nothing for a model
+                out[k] = expand(v, seen, in_properties=(k == "properties"))
+            return out
+        if isinstance(node, list):
+            return [expand(v, seen) for v in node]
+        return node
+
+    out = expand(schema, ())
+    if "$defs" in schema and "$ref" in json.dumps(out):
+        out["$defs"] = schema["$defs"]  # a recursive model: keep the definitions it still points at
+    return out
 
 
 def tool(func: Callable[..., Any]) -> ToolSpec:

@@ -227,3 +227,32 @@ def test_tool_calls_expectation_needs_distinct_matching_calls():
         ToolCall(name="w", args={"location": "Paris"}), ToolCall(name="w", args={"location": "Paris"})])
     names = {c.name: c.passed for c in deterministic_checks(case.expect, twice_paris)}
     assert names["call[0]:w"] is True and names["call[1]:w"] is False  # the same call cannot satisfy both
+
+
+def test_args_contain_reaches_nested_arguments_and_sequence_is_ordered():
+    from mfa.evals.dataset import Expectations, ExpectedCall
+    from mfa.evals.graders import deterministic_checks
+    from mfa.runtime.result import AgentResult, ToolCall
+
+    result = AgentResult(target="local", input="i", output="o", tool_calls=[
+        ToolCall(name="lookup_order", args={"order_id": ""}),
+        ToolCall(name="search_products", args={"query": "Running shoes", "filters": {"category": "shoes", "sizes": ["9", "10"], "max_price": 100.0}, "page": 1}),
+        ToolCall(name="start_return", args={"order_id": "ORD-1001", "sku": "SH-RUN-9", "reason": "too_small"}),
+    ])
+    exp = Expectations(
+        tool_args_contain={"search_products": {"filters.category": "shoes", "filters.sizes": ["10"], "filters.max_price": 100, "query": "running"}},
+        tool_calls=[ExpectedCall(tool="lookup_order", args={"order_id": ""}),
+                    ExpectedCall(tool="search_products", args_contain={"filters": {"sizes": ["9", "10"]}, "page": 1})],
+        tool_sequence=["lookup_order", "start_return"],
+    )
+    checks = {c.name: c for c in deterministic_checks(exp, result)}
+    assert all(c.passed for c in checks.values()), {n: c.detail for n, c in checks.items() if not c.passed}
+
+    wrong = Expectations(
+        tool_args_contain={"search_products": {"filters.sizes": ["11"], "filters.max_price": 99}},
+        tool_sequence=["start_return", "lookup_order"],
+        tool_calls=[ExpectedCall(tool="search_products", args_contain={"filters.category": "apparel"})],
+    )
+    checks = {c.name: c for c in deterministic_checks(wrong, result)}
+    assert checks["args_contain:search_products"].passed is False and checks["sequence"].passed is False
+    assert checks["call[0]:search_products"].passed is False

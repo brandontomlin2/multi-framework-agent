@@ -34,15 +34,54 @@ def _lc(s: str) -> str:
     return s.casefold()
 
 
+def _get_path(data: Any, path: str) -> tuple[bool, Any]:
+    """Follow a dotted path (``filters.sizes.0``) into nested dicts and lists."""
+    cur = data
+    for part in path.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        elif isinstance(cur, list) and part.isdigit() and int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            return False, None
+    return True, cur
+
+
 def _args_match(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
+    """Exact match of every expected argument (case-insensitive for strings); keys may be dotted paths."""
     for k, v in expected.items():
-        got = actual.get(k)
+        found, got = _get_path(actual, k)
+        if not found:
+            return False
         if isinstance(v, str) and isinstance(got, str):
             if _lc(v) != _lc(got):
                 return False
         elif got != v:
             return False
     return True
+
+
+def _contains(expected: Any, actual: Any) -> bool:
+    """``expected`` is contained in ``actual``: a case-insensitive substring for strings, a subset for lists,
+    recursive containment for dicts, equality (after numeric coercion) for numbers and booleans."""
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(_contains(v, _get_path(actual, k)[1]) for k, v in expected.items())
+    if isinstance(expected, list):
+        return isinstance(actual, list) and all(any(_contains(e, a) for a in actual) for e in expected)
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return expected == actual
+    if isinstance(expected, (int, float)):
+        try:
+            return float(actual) == float(expected)
+        except (TypeError, ValueError):
+            return False
+    if expected is None:
+        return actual is None
+    return _lc(str(expected)) in _lc("" if actual is None else str(actual))
+
+
+def _args_contain(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
+    return all(_contains(v, _get_path(actual, k)[1]) for k, v in expected.items())
 
 
 def deterministic_checks(exp: Expectations, result: AgentResult) -> list[Check]:
@@ -68,10 +107,12 @@ def deterministic_checks(exp: Expectations, result: AgentResult) -> list[Check]:
         checks.append(Check(name=f"args:{tool}", passed=ok, detail=f"expected⊆{expected_args} got={actual}"))
     for tool, expected_sub in exp.tool_args_contain.items():
         actual = [c.args for c in result.tool_calls if c.name == tool]
-        ok = any(
-            all(_lc(str(v)) in _lc(str(a.get(k, ""))) for k, v in expected_sub.items()) for a in actual
-        )
+        ok = any(_args_contain(expected_sub, a) for a in actual)
         checks.append(Check(name=f"args_contain:{tool}", passed=ok, detail=f"expected {expected_sub} got={actual}"))
+    if exp.tool_sequence:
+        it = iter(names)
+        ok = all(any(n == want for n in it) for want in exp.tool_sequence)
+        checks.append(Check(name="sequence", passed=ok, detail=f"expected {exp.tool_sequence} in this order; calls={names}"))
 
     if exp.skills_used or exp.skills_not_used:
         used = skills_used(result.tool_calls)
@@ -86,7 +127,7 @@ def deterministic_checks(exp: Expectations, result: AgentResult) -> list[Check]:
         for i, want in enumerate(exp.tool_calls):
             hit = next(
                 (c for c in unmatched if c.name == want.tool and _args_match(want.args, c.args)
-                 and all(_lc(str(v)) in _lc(str(c.args.get(k, ""))) for k, v in want.args_contain.items())),
+                 and _args_contain(want.args_contain, c.args)),
                 None,
             )
             if hit is not None:
