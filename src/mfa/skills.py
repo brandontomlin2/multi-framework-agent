@@ -69,6 +69,9 @@ class SkillSandbox:
         self.root = (root or skills_root()).rstrip("/")
         self.skills = list(skills)
         self.local = {sk.name: sk for sk in skills if sk.path is not None}
+        # Anthropic-managed skills have no folder here: the Managed Agents server mounts and
+        # sandboxes them itself, so the runner approves calls that stay inside such a skill.
+        self.remote = {sk.name for sk in skills if sk.path is None and sk.name not in self.local}
         self.allow_scripts = allow_scripts
         self.bash_timeout_ms = bash_timeout_ms
 
@@ -90,6 +93,17 @@ class SkillSandbox:
             return f"{self.location(sk)}/{rel.as_posix()}".rstrip("/")
         return None
 
+    @staticmethod
+    def _parts(p: Any) -> list[str]:
+        return [part for part in str(p).strip().split("/") if part not in ("", ".")]
+
+    def remote_skill(self, p: Any) -> str | None:
+        """The Anthropic-managed skill a model-supplied path names (root-agnostic), or None; ``..`` never qualifies."""
+        parts = self._parts(p)
+        if ".." in parts:
+            return None
+        return next((part for part in parts if part in self.remote), None)
+
     def resolve(self, p: str) -> Path:
         """Map a model-supplied path to a real path inside a skill folder, or raise.
 
@@ -98,9 +112,14 @@ class SkillSandbox:
         it then names one of this agent's skills followed by a path inside it.
         """
         text = str(p).strip()
-        parts = [part for part in text.split("/") if part not in ("", ".")]
+        parts = self._parts(text)
         idx = next((i for i, part in enumerate(parts) if part in self.local), None)
         if idx is None:
+            if remote := self.remote_skill(text):
+                raise PermissionError(
+                    f"skill {remote} is Anthropic-managed: its files are available on Claude Managed Agents only "
+                    "(set MFA_ANTHROPIC_SKILLS_DIR to mirror it locally)"
+                )
             raise PermissionError(f"{text} is not inside a skill folder ({self.root}/<skill>/...)")
         folder = self.local[parts[idx]].path.resolve()
         real = folder.joinpath(*parts[idx + 1:]).resolve()
@@ -108,12 +127,14 @@ class SkillSandbox:
             raise PermissionError(f"{text} is not inside a skill folder ({self.root}/<skill>/...)")
         return real
 
-    def check_bash(self, command: str | None) -> tuple[list[str], Path]:
+    def check_bash(self, command: str | None) -> tuple[list[str], Path | None]:
         """Validate a bash command: a bare interpreter name (or the script itself) plus a file under a skill's scripts/.
 
         The string is what the Managed Agents server will run in a real shell, so
         anything bash would interpret (operators, expansions, comments, a second
-        line) is refused rather than normalised away.
+        line) is refused rather than normalised away. For an Anthropic-managed skill
+        the check is lexical (``<skill>/scripts/<file>``) and the folder is None:
+        only the Managed Agents server, which mounts the skill, can run it.
         """
         if not self.allow_scripts:
             raise PermissionError("running scripts is not enabled for this agent (allow_skill_scripts)")
@@ -127,6 +148,12 @@ class SkillSandbox:
         script_index = 1 if argv and argv[0] in _INTERPRETERS else 0
         if len(argv) <= script_index:
             raise PermissionError(f"only a skill's own scripts/ may be run: {command}")
+        if remote := self.remote_skill(argv[script_index]):
+            parts = self._parts(argv[script_index])
+            tail = parts[parts.index(remote) + 1:]
+            if len(tail) != 2 or tail[0] != "scripts" or tail[1].startswith("-"):
+                raise PermissionError(f"only a skill's own scripts/ may be run: {command}")
+            return argv, None
         script = self.resolve(argv[script_index])
         folder = next(sk.path.resolve() for sk in self.local.values() if script.is_relative_to(sk.path.resolve()))
         if not script.is_file() or script.parent != folder / "scripts":
@@ -160,11 +187,15 @@ class SkillSandbox:
         approved here is one the LangGraph targets would have run.
         """
         if name == "read":
-            self.resolve(str(args.get("file_path", "")))
+            file_path = str(args.get("file_path", ""))
+            if not self.remote_skill(file_path):
+                self.resolve(file_path)
         elif name in ("glob", "grep"):
-            self.search_root(str(args.get("pattern", "")), args.get("path"))
-            if ".." in str(args.get("pattern", "")).split("/"):
+            pattern, path = str(args.get("pattern", "")), args.get("path")
+            if ".." in pattern.split("/"):
                 raise PermissionError("pattern may not contain '..'")
+            if not (path and self.remote_skill(path)):
+                self.search_root(pattern, path)
         elif name == "bash":
             if args.get("restart") and not args.get("command"):
                 return
@@ -226,6 +257,9 @@ class SkillSandbox:
         if restart and not command:
             return "bash session restarted"  # no persistent session here: each call is a fresh process
         argv, folder = self.check_bash(command)
+        if folder is None:
+            remote = next((r for a in argv if (r := self.remote_skill(a))), "")
+            raise PermissionError(f"skill {remote} is Anthropic-managed: its scripts run on Claude Managed Agents only")
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "LANG", "LC_ALL", "PYTHONIOENCODING")}
         with tempfile.TemporaryDirectory(prefix="mfa-skill-") as home:
             env.update({"HOME": home, "MFA_SKILL_DIR": str(folder)})
@@ -323,10 +357,14 @@ def skills_prompt_block(spec: AgentSpec, sandbox: SkillSandbox | None = None) ->
 
 
 def skills_used(tool_calls: list[Any]) -> list[str]:
-    """Skill names whose SKILL.md was read, in order of first read (root-agnostic)."""
+    """Skill names whose SKILL.md was read successfully, in order of first read (root-agnostic).
+
+    A read that failed, was refused by the sandbox or hit the iteration cap does
+    not count: the model never saw the skill.
+    """
     seen: list[str] = []
     for call in tool_calls:
-        if getattr(call, "name", None) != "read":
+        if getattr(call, "name", None) != "read" or getattr(call, "is_error", False):
             continue
         m = _SKILL_MD_PATH.search(str((getattr(call, "args", None) or {}).get("file_path", "")))
         if m and m.group("skill") not in seen:

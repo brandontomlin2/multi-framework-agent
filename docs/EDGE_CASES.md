@@ -17,7 +17,7 @@ Google's *templates* (agents-cli scaffold, LangChain/Claude extensions, starter-
 | 3 | Very large tool outputs | high-volume analyzer summarises; long-horizon prunes; CMA offloads >100,000 chars | **missing** for agent tools (only skill reads truncate): a 2 MB result is sent whole on LangGraph and offloaded on CMA — a divergence | `AgentSpec.max_tool_output_chars` applied in `ToolSpec.run` on every target; `expect.tool_output_max_chars` | L |
 | 4 | Binary / media results | retail-virtual-tryon strips bytes, returns URIs; genmedia never handles bytes | **missing**: `json.dumps(default=str)` would stringify bytes | rule "tools return references"; `ToolSpec.run` rejects `bytes` with a clear error | L |
 | 5 | Long-running / async tools | `LongRunningFunctionTool` → `{"status": "pending"}`; OAuth `{"pending": true}` | **not modelled** | portable job-handle pattern: `start_x` returns `{status: pending, job_id}`, `check_x` polls; fixture flips on 2nd call | M |
-| 6 | Tool errors mid-plan and recovery | `retrieve_docs` folds exceptions into text; `not_found` with alternatives | **runtime only** (shared error text, `is_error` flag, parity test `boom`) | `ToolCall.is_error`, `expect.tool_errors: [tool]`, `tool_output_contains: {tool: text}`, fault toggle `MFA_<AGENT>_FAULTS` | L |
+| 6 | Tool errors mid-plan and recovery | `retrieve_docs` folds exceptions into text; `not_found` with alternatives | **runtime only** (shared error text, `ToolCall.is_error` on every target, parity test `boom`) | `expect.tool_errors: [tool]`, `tool_output_contains: {tool: text}`, fault toggle `MFA_<AGENT>_FAULTS` | L |
 | 7 | Prompt injection through a tool result | safety-plugins `fib_tool` injected message + LlmAsAJudge on tool output | **partial** (user-message injection only) | a fixture record carrying an injected instruction; `output_not_contains: [marker]` | L |
 | 8 | Slot filling and corrections over 3+ turns, per-turn assertions | staged-ui-widgets multi-turn evalsets; brand-aligned `revision_prompt` | **supported** for 2 turns on the combined result; cannot assert a specific turn | `turns: [{input, expect}]`; harness grades each turn and the whole | M |
 | 9 | State the tools carry across turns (cursor, pagination, preferences) | document analyzer cursor in `tool_context.state`; `user:` profile; `set_score` | **missing** (tools are stateless; no `ToolContext`) | per-thread state dict passed to tools identically on all targets (CMA tools run host-side); `initial_state`, `expect.state_contains` | M–H |
@@ -57,7 +57,7 @@ Coverage: every catalogue row except #11 (sub-agents) and #15 (artifacts) is exe
 
 ## 5. Suggested order of work
 
-1. Cheap format additions that the new agents need (#1, #6, #18, #21, #22, #3/#4 guards): `tool_rounds`, `tool_call_counts`, `tool_sequence`, `tool_errors`/`is_error`, `error_contains`, judge lists, output caps.
+1. Cheap format additions that the new agents need (#1, #6, #18, #21, #22, #3/#4 guards): `tool_rounds`, `tool_call_counts`, `tool_sequence`, `tool_errors` (over the recorded `is_error`), `error_contains`, judge lists, output caps.
 2. `order_support_agent` (the richest exercise of argument shapes, errors and conversation).
 3. Per-turn expectations (#8), then `docs_research_agent` (#10 structured output, #3 large outputs).
 4. `expense_approvals_agent`, the fault toggle and a French/Spanish case.

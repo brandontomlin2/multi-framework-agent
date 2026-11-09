@@ -18,6 +18,7 @@ from pathlib import Path
 
 from mfa.runtime.graph import recursion_limit_for
 from mfa.runtime.result import AgentResult
+from mfa.spec import anthropic_skill
 from mfa.skills import skills_prompt_block
 from mfa.spec import (
     AGENT_ENGINE,
@@ -482,7 +483,8 @@ def test_cma_translation_attaches_skills_and_gates_the_file_tools():
     assert [t["name"] for t in params["tools"][1:]] == ["book", "boom"]
     assert params["system"] == SKILL_SPEC.system_prompt  # the server announces skills itself
     assert client.uploaded == {"parity-skill": ["parity-skill/SKILL.md", "parity-skill/references/notes.md", "parity-skill/scripts/hello.py"]}
-    assert rec["skills"]["parity-skill"]["version"] == "skillver_1" and rec["toolset"] == ["read", "glob", "grep"]
+    assert rec["skills"]["parity-skill"]["version"] == "skillver_1"
+    assert rec["toolset"] == {"policy": "always_ask", "enabled": ["read", "glob", "grep"], "disabled": []}
 
 
 def test_reads_are_allowed_under_whatever_root_the_server_announces(make_runner):
@@ -497,8 +499,9 @@ def test_reads_are_allowed_under_whatever_root_the_server_announces(make_runner)
     skill_md = runner.run("go")
     assert skill_md.metadata["skill_root"] == "/mnt/skills/custom" and skill_md.metadata["skills_used"] == ["parity-skill"]
     runner = make_runner(CLAUDE_MANAGED, [{"tool": "read", "args": {"file_path": "/mnt/skills/custom/other-skill/SKILL.md"}}, {"text": "ok"}], SKILL_SPEC, SKILL_REF)
-    runner.run("go")
+    denied = runner.run("go")
     assert [e["result"] for e in runner.fake.sent if e["type"] == "user.tool_confirmation"] == ["deny"]
+    assert "skills_used" not in denied.metadata and denied.tool_calls[0].is_error is True  # a refused read is not a skill used
 
 
 def test_server_run_builtins_still_count_rounds_and_stop_at_the_cap():
@@ -531,7 +534,7 @@ def test_timeout_answers_paused_calls_before_interrupting(monkeypatch):
     """A turn that times out between a paused call and its idle must not leave the call unanswered."""
     import mfa.targets.claude_managed as cm
 
-    ticks = iter([0.0, 0.5, 100.0, 100.0, 100.0, 100.0])
+    ticks = iter([0.0, 0.5, 0.5, 100.0, 100.0, 100.0, 100.0])  # start; span start; the paused call; then the clock jumps
     monkeypatch.setattr(cm.time, "monotonic", lambda: next(ticks, 100.0))
     monkeypatch.setattr(cm, "DEFAULT_TURN_TIMEOUT_S", 10.0)
     record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
@@ -540,3 +543,68 @@ def test_timeout_answers_paused_calls_before_interrupting(monkeypatch):
     assert r.error == "turn exceeded 10.0s"
     last = client.batches[-1]
     assert [e["type"] for e in last] == ["user.tool_confirmation", "user.interrupt"] and last[0]["result"] == "deny"
+
+
+XLSX_SPEC = replace(SKILL_SPEC, name="xlsx_parity_agent", skills=[*SKILL_SPEC.skills, anthropic_skill("xlsx")])
+
+
+def test_cma_runner_approves_reads_inside_an_anthropic_managed_skill():
+    """The server mounts Anthropic skills itself: the runner approves calls that stay inside one the agent has,
+    records the server's result, and still denies a skill the agent does not have."""
+    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
+    remote = {"/mnt/skills/public/xlsx/SKILL.md": "---\nname: xlsx\ndescription: Spreadsheets.\n---\nUse openpyxl."}
+    client = FakeCMAClient(
+        script=[{"tool": "read", "args": {"file_path": "/mnt/skills/public/xlsx/SKILL.md"}},
+                {"tool": "read", "args": {"file_path": "/mnt/skills/public/pptx/SKILL.md"}}, {"text": "ok"}],
+        spec=XLSX_SPEC, remote_files=remote)
+    r = ClaudeManagedRunner(XLSX_SPEC, record, client=client).run("go")
+    assert [e["result"] for e in client.sent if e["type"] == "user.tool_confirmation"] == ["allow", "deny"]
+    assert r.tool_calls[0].output.startswith("     1\t---") and r.tool_calls[0].is_error is False  # the server's rendering
+    assert r.tool_calls[1].is_error is True and "not inside a skill folder" in r.tool_calls[1].output
+    assert r.metadata["skills_used"] == ["xlsx"] and r.metadata["skill_root"] == "/mnt/skills/public"
+    assert r.output == "ok" and r.error is None
+
+
+@pytest.mark.parametrize("target", TARGETS)
+def test_tool_calls_carry_the_error_flag_on_every_target(target, make_runner):
+    """Besides the same error text, every target marks which calls failed, so skills_used and future
+    tool_errors expectations never mistake a refused read for a successful one."""
+    script = [{"calls": [BOOK_CALL, {"tool": "boom", "args": {"reason": "x"}}, {"tool": "nope", "args": {}}]}, {"text": "ok"}]
+    r = make_runner(target, script, PARITY_SPEC, SELF_REF).run("go")
+    assert [(c.name, c.is_error) for c in r.tool_calls] == [("book", False), ("boom", True), ("nope", True)]
+
+
+def test_parallel_server_run_builtins_are_one_round_like_one_ai_message():
+    """Under an auto policy the server runs a message's calls itself. One model message is still one round, as in
+    the graph, whether the results follow the message or interleave with its calls: the span events delimit it."""
+    from types import SimpleNamespace
+
+    from tests.fakes import _idle, _tool_result
+
+    record = {"agent_id": "a", "agent_version": 1, "environment_id": "e", "model": "m"}
+    two_reads = {"calls": [READ_SKILL, READ_NOTES]}
+    client = FakeCMAClient(script=[two_reads, two_reads, {"text": "done"}], spec=SKILL_SPEC, builtin_permission="allow")
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error is None and r.output == "done" and [c.name for c in r.tool_calls] == ["read"] * 4
+    assert all(c.output and not c.is_error for c in r.tool_calls)
+
+    client = FakeCMAClient(script=[two_reads] * 3 + [{"text": "never"}], spec=SKILL_SPEC, builtin_permission="allow")
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error == iteration_limit_error(2) and len(r.tool_calls) == 6  # the third message is the round past the cap
+
+    # Results interleaved with the calls of the same message (a server that executes as it streams).
+    client = FakeCMAClient(script=[], spec=SKILL_SPEC, builtin_permission="allow")
+    for _ in range(2):
+        client._pending.append(SimpleNamespace(type="span.model_request_start"))
+        for args in (READ_SKILL["args"], READ_NOTES["args"]):
+            ev_id = f"sevt_{len(client._pending)}"
+            client._pending.append(SimpleNamespace(type="agent.tool_use", id=ev_id, name="read", input=args,
+                                                   evaluated_permission="allow", evaluation=SimpleNamespace(type="always_allow")))
+            client._pending.append(_tool_result(ev_id, *client._execute_builtin("read", dict(args))))
+        client._pending.append(SimpleNamespace(type="span.model_request_end"))
+    client._pending.append(SimpleNamespace(type="span.model_request_start"))
+    client._pending.append(SimpleNamespace(type="agent.message", content=[SimpleNamespace(type="text", text="done")]))
+    client._pending.append(SimpleNamespace(type="span.model_request_end"))
+    client._pending.append(_idle("end_turn"))
+    r = ClaudeManagedRunner(SKILL_SPEC, record, client=client).run("go")
+    assert r.error is None and r.output == "done" and len(r.tool_calls) == 4

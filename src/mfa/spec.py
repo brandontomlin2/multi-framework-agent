@@ -191,13 +191,7 @@ class SkillSpec:
         return out
 
     def content_hash(self) -> str:
-        h = hashlib.sha256()
-        for rel, data in self.files():
-            h.update(rel.encode())
-            h.update(b"\0")
-            h.update(data)
-            h.update(b"\0")
-        return h.hexdigest()
+        return hash_skill_files(self.files())
 
     @property
     def has_scripts(self) -> bool:
@@ -262,6 +256,17 @@ def local_skills(folder: str | Path) -> list[SkillSpec]:
     if not root.is_dir():
         return []
     return [skill(p.parent) for p in sorted(root.glob("*/SKILL.md"))]
+
+
+def hash_skill_files(files: list[tuple[str, bytes]]) -> str:
+    """Content hash of a skill's ``files()`` listing (path and bytes of every file, in order)."""
+    h = hashlib.sha256()
+    for rel, data in files:
+        h.update(rel.encode())
+        h.update(b"\0")
+        h.update(data)
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def anthropic_skill(skill_id: str, version: str | None = None) -> SkillSpec:

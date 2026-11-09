@@ -129,7 +129,42 @@ def test_skills_used_and_root_detection():
     calls = [ToolCall(name="get_weather_today", args={"location": "Paris"}),
              ToolCall(name="read", args={"file_path": "/mnt/skills/custom/weather-briefing/SKILL.md"}),
              ToolCall(name="read", args={"file_path": "/mnt/skills/custom/weather-briefing/references/x.md"}),
-             ToolCall(name="read", args={"file_path": "/mnt/skills/custom/other-skill/SKILL.md"})]
-    assert skills_used(calls) == ["weather-briefing", "other-skill"]
+             ToolCall(name="read", args={"file_path": "/mnt/skills/custom/other-skill/SKILL.md"}),
+             ToolCall(name="read", args={"file_path": "/mnt/skills/custom/denied-skill/SKILL.md"},
+                      output="Error: tool read failed: PermissionError: denied", is_error=True)]
+    assert skills_used(calls) == ["weather-briefing", "other-skill"]  # a refused or failed read never counts
     assert skill_root_of("/mnt/skills/custom/weather-briefing/SKILL.md") == "/mnt/skills/custom"
     assert skill_root_of("weather-briefing/SKILL.md") is None and skill_root_of("notes.md") is None
+
+
+def test_anthropic_managed_skills_are_approved_for_the_server_but_unreadable_locally(monkeypatch):
+    """An Anthropic skill has no folder here. On Claude Managed Agents the server mounts and sandboxes it, so the
+    runner approves calls that stay inside the attached skill at whatever root the server uses; the LangGraph
+    targets, which have no copy, say so instead of pretending the file is missing."""
+    monkeypatch.delenv("MFA_ANTHROPIC_SKILLS_DIR", raising=False)
+    spec = AgentSpec(name="s", description="d", system_prompt="p", tools=[],
+                     skills=[*local_skills(SKILLS), anthropic_skill("xlsx")], allow_skill_scripts=True)
+    sb = SkillSandbox.for_spec(spec)
+    assert sb.remote == {"xlsx"} and "parity-skill" in sb.local
+    sb.authorize("read", {"file_path": "/mnt/skills/public/xlsx/SKILL.md"})
+    sb.authorize("read", {"file_path": "xlsx/references/forms.md"})
+    sb.authorize("glob", {"pattern": "**/*.py", "path": "/mnt/skills/public/xlsx"})
+    sb.authorize("grep", {"pattern": "openpyxl", "path": "/mnt/skills/public/xlsx/references"})
+    sb.authorize("bash", {"command": "python3 /mnt/skills/public/xlsx/scripts/recalc.py book.xlsx"})
+    for name, args in [
+        ("read", {"file_path": "/mnt/skills/public/pptx/SKILL.md"}),           # a skill this agent does not have
+        ("read", {"file_path": "/mnt/skills/public/xlsx/../pptx/SKILL.md"}),   # never '..'
+        ("glob", {"pattern": "**/*", "path": "/mnt/skills/public"}),            # the whole mount
+        ("glob", {"pattern": "../*", "path": "/mnt/skills/public/xlsx"}),
+        ("bash", {"command": "python3 /mnt/skills/public/xlsx/recalc.py"}),     # not under scripts/
+        ("bash", {"command": "python3 /mnt/skills/public/xlsx/scripts/sub/x.py"}),
+        ("bash", {"command": "python3 /mnt/skills/public/xlsx/scripts/recalc.py; id"}),
+    ]:
+        with pytest.raises(PermissionError):
+            sb.authorize(name, args)
+    with pytest.raises(PermissionError, match="Anthropic-managed"):
+        sb.read("/mnt/skills/public/xlsx/SKILL.md")
+    with pytest.raises(PermissionError, match="Anthropic-managed"):
+        sb.bash("python3 /mnt/skills/public/xlsx/scripts/recalc.py book.xlsx")
+    # the local skill is unaffected
+    assert sb.read(f"{ROOT}/SKILL.md").startswith("---")

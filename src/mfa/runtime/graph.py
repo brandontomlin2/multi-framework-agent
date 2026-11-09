@@ -149,16 +149,19 @@ def _text(message: BaseMessage) -> str:
 def extract_result(messages: list[BaseMessage], *, target: str, user_input: str) -> AgentResult:
     """Convert the messages produced by one turn into the shared AgentResult shape."""
     outputs: dict[str, str] = {}
+    errors: dict[str, bool] = {}
     for m in messages:
         if isinstance(m, ToolMessage):
             outputs[m.tool_call_id] = m.content if isinstance(m.content, str) else json.dumps(m.content)
+            errors[m.tool_call_id] = getattr(m, "status", "success") == "error"
 
     calls: list[ToolCall] = []
     final = ""
     for m in messages:
         if isinstance(m, AIMessage):
             for tc in m.tool_calls:
-                calls.append(ToolCall(name=tc["name"], args=tc["args"], output=outputs.get(tc["id"])))
+                calls.append(ToolCall(name=tc["name"], args=tc["args"], output=outputs.get(tc["id"]),
+                                      is_error=errors.get(tc["id"], False)))
             text = _text(m)
             if text:
                 final = text

@@ -62,14 +62,18 @@ RETRY_DELAYS_S = (1.5, 3.0)  # Open-Meteo's free tier rate-limits bursts; two sh
 def _get_json(url: str, params: dict[str, Any]) -> dict[str, Any]:
     full = f"{url}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(full, headers={"User-Agent": USER_AGENT})
-    for attempt, delay in enumerate((*RETRY_DELAYS_S, None)):
+    for delay in (*RETRY_DELAYS_S, None):
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             if exc.code not in RETRY_STATUSES or delay is None:
                 raise
-            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            # A reset or stalled connection is how Open-Meteo's edge throttles too.
+            if delay is None:
+                raise
+        time.sleep(delay)
     raise RuntimeError("unreachable")  # pragma: no cover
 
 

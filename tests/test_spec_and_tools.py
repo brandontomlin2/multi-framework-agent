@@ -169,7 +169,9 @@ def test_open_meteo_retries_rate_limits(monkeypatch):
 
     def flaky(req, timeout):
         calls.append(req)
-        if len(calls) < 3:
+        if len(calls) == 1:
+            raise urllib.error.URLError(ConnectionResetError(104, "Connection reset by peer"))  # the edge's other throttle
+        if len(calls) == 2:
             raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
         return io.BytesIO(b'{"ok": true}')
 
@@ -187,3 +189,14 @@ def test_open_meteo_retries_rate_limits(monkeypatch):
     monkeypatch.setattr(weather.urllib.request, "urlopen", always_404)
     with pytest.raises(urllib.error.HTTPError):
         weather._get_json("https://x", {})
+
+    resets = []
+
+    def always_reset(req, timeout):
+        resets.append(req)
+        raise TimeoutError("The handshake operation timed out")
+
+    monkeypatch.setattr(weather.urllib.request, "urlopen", always_reset)
+    with pytest.raises(TimeoutError):
+        weather._get_json("https://x", {})
+    assert len(resets) == 3  # two retries, then the error surfaces

@@ -31,8 +31,15 @@ GEMINI_THINKING_BUDGET = {"low": 1024, "medium": 8192, "high": 16384, "xhigh": 2
 
 
 def effective_effort(effort: str | None) -> str | None:
-    """``MFA_EFFORT`` overrides the spec's effort on every target."""
-    return os.environ.get("MFA_EFFORT") or effort
+    """``MFA_EFFORT`` overrides the spec's effort on every target; it is validated like ``AgentSpec.effort``."""
+    from mfa.spec import EFFORT_LEVELS
+
+    env = os.environ.get("MFA_EFFORT")
+    if env:
+        if env not in EFFORT_LEVELS:
+            raise ValueError(f"MFA_EFFORT must be one of {', '.join(EFFORT_LEVELS)}, not {env!r}")
+        return env
+    return effort
 
 
 def make_chat_model(model: str, *, effort: str | None = None) -> BaseChatModel:

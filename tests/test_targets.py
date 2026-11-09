@@ -181,3 +181,55 @@ def test_cma_deploy_uploads_a_skill_once_and_versions_it_on_change(tmp_path):
     rec3 = target.deploy(spec2, client=client)
     assert len(client.uploaded["weather-briefing"]) == 6 and rec3["skills"]["weather-briefing"]["version"] == "skillver_2"
     assert client.updated_agents[-1][1]["skills"][0]["version"] == "skillver_2"
+
+
+def test_mfa_effort_reaches_claude_managed_and_is_validated(monkeypatch):
+    from dataclasses import replace
+
+    from mfa.runtime.models import effective_effort
+    from mfa.targets.claude_managed import ClaudeManagedTarget, model_params
+
+    spec = replace(SPEC, effort="xhigh")
+    monkeypatch.setenv("MFA_EFFORT", "low")
+    assert model_params(spec, "claude-opus-5-5")["effort"] == "low"  # the env knob wins on CMA too
+    client = FakeCMAClient(spec=spec)
+    assert ClaudeManagedTarget().deploy(spec, client=client)["effort"] == "low"
+    monkeypatch.setenv("MFA_EFFORT", "hgih")
+    with pytest.raises(ValueError, match="MFA_EFFORT"):
+        effective_effort("high")
+    with pytest.raises(ValueError, match="MFA_EFFORT"):
+        model_params(spec, "claude-opus-5-5")
+
+
+def test_cma_deploy_reuses_the_skill_a_registered_agent_already_has(tmp_path):
+    """After ``mfa register`` the record knows the attached skill's id but not its content: the next deploy must
+    give that skill a new version, not create a duplicate skill on the account."""
+    import shutil
+    from dataclasses import replace
+
+    from mfa import deployments
+    from mfa.spec import CLAUDE_MANAGED, local_skills
+
+    skills_dir = tmp_path / "skills"
+    shutil.copytree(SKILL_DIR, skills_dir / "weather-briefing")
+    spec = replace(SPEC, skills=local_skills(skills_dir))
+    deployments.save(spec.name, CLAUDE_MANAGED, {
+        "target": CLAUDE_MANAGED, "agent_id": "agent_reg", "agent_version": 3, "environment_id": "env_reg", "model": "m",
+        "managed_by": "external", "agent_skills": [{"type": "custom", "skill_id": "skill_pre", "version": "skillver_0"}],
+    })
+    client = FakeCMAClient(spec=spec, registered_skills={"skill_pre": "weather-briefing"})
+    rec = ClaudeManagedTarget().deploy(spec, client=client)
+    assert client.skill_versions == {"weather-briefing": 2} and len(client.uploaded["weather-briefing"]) == 3
+    assert rec["skills"]["weather-briefing"]["skill_id"] == "skill_pre" and rec["skills"]["weather-briefing"]["version"] == "skillver_2"
+    assert client.updated_agents[-1][1]["skills"] == [{"type": "custom", "skill_id": "skill_pre", "version": "skillver_2"}]
+    rec2 = ClaudeManagedTarget().deploy(spec, client=client)  # content now known and unchanged: nothing uploaded
+    assert client.skill_versions == {"weather-briefing": 2} and rec2["skills"]["weather-briefing"]["version"] == "skillver_2"
+
+
+def test_cma_record_describes_the_toolset_it_configured(monkeypatch):
+    from mfa.targets.claude_managed import enabled_builtins, toolset_params
+
+    assert enabled_builtins(toolset_params(SPEC)) == {"policy": "always_ask", "enabled": ["read", "glob", "grep"], "disabled": []}
+    monkeypatch.setenv("MFA_CMA_ENABLE_TOOLSET", "1")
+    assert enabled_builtins(toolset_params(SPEC)) == {"policy": "auto", "enabled": "all", "disabled": ["web_fetch", "web_search"]}
+    assert enabled_builtins(None) is None

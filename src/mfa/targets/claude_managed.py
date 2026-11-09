@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from mfa import deployments
+from mfa.runtime.models import effective_effort
 from mfa.runtime.result import AgentResult, ToolCall
 from mfa.skills import SkillSandbox, skill_root_of, skills_used
 from mfa.spec import (
@@ -44,6 +45,7 @@ from mfa.spec import (
     AgentSpec,
     ToolResult,
     format_tool_error,
+    hash_skill_files,
     iteration_limit_error,
     unknown_tool_error,
 )
@@ -54,8 +56,8 @@ DEFAULT_TURN_TIMEOUT_S = float(os.environ.get("MFA_CMA_TURN_TIMEOUT_S", "600"))
 def model_params(spec: AgentSpec, model: str) -> dict[str, Any]:
     """``model`` as an object so effort (and optional speed / inference geo) travel with the agent."""
     m: dict[str, Any] = {"id": model}
-    if spec.effort:
-        m["effort"] = spec.effort
+    if effort := effective_effort(spec.effort):  # MFA_EFFORT wins here as on every other target
+        m["effort"] = effort
     if speed := os.environ.get("MFA_CMA_SPEED"):
         m["speed"] = speed
     if geo := os.environ.get("MFA_CMA_INFERENCE_GEO"):
@@ -147,17 +149,23 @@ def sync_skills(client: Any, spec: AgentSpec, existing: dict[str, Any] | None) -
     uploaded version id.
     """
     known = dict((existing or {}).get("skills", {}))
+    attached = _attached_custom_skills(client, existing)
     pin_latest = os.environ.get("MFA_CMA_SKILL_VERSION") == "latest"
     out: dict[str, dict[str, Any]] = {}
     for sk in spec.local_skills:
-        digest = sk.content_hash()
-        files = [(f"{sk.name}/{rel}", data) for rel, data in sk.files()]
+        files = sk.files()
+        digest = hash_skill_files(files)
+        upload = [(f"{sk.name}/{rel}", data) for rel, data in files]
         prev = known.get(sk.name)
+        if prev is None and sk.name in attached:
+            # A registered agent (``mfa register``): the record knows the attached skill's id
+            # but not its content, so give that skill a new version rather than a duplicate.
+            prev = {"skill_id": attached[sk.name], "sha256": None}
         if prev is None:
-            created = client.skills.create(files=files, display_name=sk.name)
+            created = client.skills.create(files=upload, display_name=sk.name)
             skill_id, version = created.id, created.latest_version_id
         elif prev.get("sha256") != digest:
-            created = client.skills.versions.create(prev["skill_id"], files=files)
+            created = client.skills.versions.create(prev["skill_id"], files=upload)
             skill_id, version = prev["skill_id"], created.id
         else:
             skill_id, version = prev["skill_id"], prev.get("version_id") or prev.get("version")
@@ -166,9 +174,37 @@ def sync_skills(client: Any, spec: AgentSpec, existing: dict[str, Any] | None) -
             "version_id": version,
             "version": "latest" if pin_latest else version,
             "sha256": digest,
-            "files": [rel for rel, _ in sk.files()],
+            "files": [rel for rel, _ in files],
         }
     return out
+
+
+def _attached_custom_skills(client: Any, existing: dict[str, Any] | None) -> dict[str, str]:
+    """``{display_name: skill_id}`` for the custom skills ``mfa register`` found attached to the live agent."""
+    out: dict[str, str] = {}
+    for ref in (existing or {}).get("agent_skills") or []:
+        if not isinstance(ref, dict) or ref.get("type") != "custom" or not ref.get("skill_id"):
+            continue
+        try:
+            info = client.skills.retrieve(ref["skill_id"])
+        except Exception:
+            continue  # deleted or not ours: a fresh upload is the only option
+        name = getattr(info, "display_name", None)
+        if name:
+            out.setdefault(name, ref["skill_id"])
+    return out
+
+
+def enabled_builtins(toolset: dict[str, Any] | None) -> dict[str, Any] | None:
+    """What a toolset entry turns on, for the deployment record: ``{"policy", "enabled", "disabled"}``."""
+    if not toolset:
+        return None
+    default = toolset.get("default_config") or {}
+    configs = toolset.get("configs") or []
+    policy = ((default.get("permission_policy") or {}).get("type")) or "auto"
+    if default.get("enabled"):
+        return {"policy": policy, "enabled": "all", "disabled": [c["name"] for c in configs if c.get("enabled") is False]}
+    return {"policy": policy, "enabled": [c["name"] for c in configs if c.get("enabled")], "disabled": []}
 
 
 def _client():
@@ -264,6 +300,7 @@ class ClaudeManagedRunner:
                 if tool_use_id not in answered and not any(q.get("tool_use_id") == tool_use_id for q in queued):
                     events.append(_confirmation(tool_use_id, "deny", reason))
                     calls[pending[tool_use_id]].output = calls[pending[tool_use_id]].output or reason
+                    calls[pending[tool_use_id]].is_error = True
             return events
 
         def flush(*extra: dict[str, Any]) -> None:
@@ -286,14 +323,18 @@ class ClaudeManagedRunner:
                     flush({"type": "user.interrupt"})
                     break
 
-                if event.type == "agent.message":
-                    in_round = False  # a new model message: the next tool call opens a new round
+                if event.type == "span.model_request_start":
+                    # The server wraps every model message in a span; all of the message's tool
+                    # calls, built-in and custom, arrive inside it. A round is one such message.
+                    in_round = False
+                elif event.type == "agent.message":
+                    in_round = False  # text precedes a message's tool calls (also covers streams without spans)
                     text = "".join(b.text for b in event.content if b.type == "text")
                     if text:
                         final_text = text  # last message of the turn, same rule as LangGraph
                 elif event.type == "agent.custom_tool_use":
-                    # Managed Agents emits one event per tool_use block of a model message,
-                    # then one requires_action idle; the idle closes the round, so parallel
+                    # Managed Agents emits one event per tool_use block of a model message
+                    # (inside the message's span), then one requires_action idle; parallel
                     # calls count as one round, exactly like one AIMessage in the graph.
                     past_cap = open_round()
                     args = dict(event.input or {})
@@ -303,7 +344,7 @@ class ClaudeManagedRunner:
                         error = limit_text
                     else:
                         output, is_error = self._tool_result(event.name, args)
-                    calls.append(ToolCall(name=event.name, args=args, output=output))
+                    calls.append(ToolCall(name=event.name, args=args, output=output, is_error=is_error))
                     result_event = {
                         "type": "user.custom_tool_result",
                         "custom_tool_use_id": event.id,
@@ -331,7 +372,7 @@ class ClaudeManagedRunner:
                     if past_cap:
                         error = limit_text
                         if permission == "ask":
-                            call.output = limit_text
+                            call.output, call.is_error = limit_text, True
                             queued.append(_confirmation(event.id, "deny", limit_text))
                         else:
                             # The server runs this one (auto / always_allow policy): keep its real
@@ -343,18 +384,20 @@ class ClaudeManagedRunner:
                             self.sandbox.authorize(event.name, args)
                             queued.append(_confirmation(event.id, "allow"))
                         except Exception as exc:
-                            call.output = format_tool_error(event.name, exc)
+                            call.output, call.is_error = format_tool_error(event.name, exc), True
                             queued.append(_confirmation(event.id, "deny", call.output))
                     elif permission == "deny":
-                        call.output = f"Permission to use {event.name} has been denied."
+                        call.output, call.is_error = f"Permission to use {event.name} has been denied.", True
                         server_denials += 1
                 elif event.type in ("agent.tool_result", "agent.mcp_tool_result"):
-                    in_round = False  # results follow every call of the model message
+                    # Results never close a round: a server-run message's results may interleave
+                    # with its remaining calls, and the next span opens the next round anyway.
                     tool_use_id = getattr(event, "tool_use_id", None)
                     idx = pending.get(tool_use_id)
                     if idx is not None:
                         if getattr(event, "is_error", False):
                             builtin_errors += 1
+                            calls[idx].is_error = True
                         if calls[idx].output is None:
                             calls[idx].output = _result_text(getattr(event, "content", None))
                     awaiting_results.discard(tool_use_id)
@@ -384,6 +427,7 @@ class ClaudeManagedRunner:
                         for tool_use_id in unknown:
                             queued.append(_confirmation(tool_use_id, "deny", "Permission denied by the runner."))
                             calls[pending[tool_use_id]].output = calls[pending[tool_use_id]].output or "Permission denied by the runner."
+                            calls[pending[tool_use_id]].is_error = True
                         # One request answers every paused call of the message; when the round
                         # was past the cap it also stops the turn (an interrupted turn ends
                         # with end_turn).
@@ -525,12 +569,12 @@ class ClaudeManagedTarget:
             "model": model,
             "deployed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
-        if spec.effort:
-            record["effort"] = spec.effort
+        if effort := effective_effort(spec.effort):
+            record["effort"] = effort
         if uploaded:
             record["skills"] = uploaded
-        if toolset := toolset_params(spec):
-            record["toolset"] = [c["name"] for c in toolset["configs"] if c.get("enabled")]
+        if toolset := enabled_builtins(toolset_params(spec)):
+            record["toolset"] = toolset
         deployments.save(spec.name, CLAUDE_MANAGED, record)
         return record
 

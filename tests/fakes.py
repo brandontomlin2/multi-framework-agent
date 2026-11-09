@@ -85,6 +85,11 @@ class FakeCMAClient:
     ``user.interrupt`` stops a running model step; while tool calls are still
     unresolved it does nothing, as on the service.
 
+    Each model step is wrapped in ``span.model_request_start`` / ``span.model_request_end``
+    as the service does (a live trace: span start, thinking, one event per tool_use
+    block, span end, then the requires_action idle); the results of server-run
+    built-ins follow the span, in call order.
+
     Built-in tools (``read``, ``glob``, ``grep``, ``bash``, ...) follow the
     ``always_ask`` protocol the mfa deploy configures: ``agent.tool_use`` with
     ``evaluated_permission="ask"``, then ``requires_action``; a
@@ -95,7 +100,13 @@ class FakeCMAClient:
     """
 
     def __init__(self, script: list[dict[str, Any]] | None = None, *, spec: Any | None = None,
-                 builtin_enabled: set[str] | None = None, builtin_permission: str | None = "ask"):
+                 builtin_enabled: set[str] | None = None, builtin_permission: str | None = "ask",
+                 registered_skills: dict[str, str] | None = None, remote_files: dict[str, str] | None = None):
+        # registered_skills: skill_id -> display_name of custom skills that already exist on the account
+        # (what ``mfa register`` finds attached). remote_files: files the server mounts that have no local
+        # copy here (Anthropic-managed skills), virtual path -> text.
+        self.registered_skills = dict(registered_skills or {})
+        self.remote_files = dict(remote_files or {})
         # builtin_permission: "ask" (always_ask: pause for a confirmation), "allow" (the server runs the
         # call at once), or None (an event without evaluated_permission that the server still blocks on).
         self.builtin_permission = builtin_permission
@@ -119,6 +130,7 @@ class FakeCMAClient:
         )
         self.skills = SimpleNamespace(
             create=self._skill_create,
+            retrieve=self._skill_retrieve,
             list=lambda **kw: [],
             versions=SimpleNamespace(create=self._skill_version_create),
         )
@@ -163,6 +175,14 @@ class FakeCMAClient:
         self.skill_versions[slug] = 1
         return SimpleNamespace(id=f"skill_fake_{slug}", latest_version_id="skillver_1", display_name=display_name or slug)
 
+    def _skill_retrieve(self, skill_id, **kw):
+        if skill_id in self.registered_skills:
+            return SimpleNamespace(id=skill_id, display_name=self.registered_skills[skill_id], latest_version_id="skillver_0")
+        for slug in self.uploaded:
+            if skill_id == f"skill_fake_{slug}":
+                return SimpleNamespace(id=skill_id, display_name=slug, latest_version_id=f"skillver_{self.skill_versions[slug]}")
+        raise LookupError(f"no skill {skill_id}")
+
     def _skill_version_create(self, skill_id, *, files, **kw):
         names = [f[0] if isinstance(f, tuple) else str(f) for f in files]
         slug = names[0].split("/")[0]
@@ -205,6 +225,8 @@ class FakeCMAClient:
         """What the server does with an approved built-in call: run it in the sandbox and render the result
         its own way. The same files are read, but the rendering deliberately differs from the LangGraph
         tools (numbered lines, reverse order, a prefix on errors) so a test cannot mistake the two."""
+        if name == "read" and args.get("file_path") in self.remote_files:
+            return _server_render(name, self.remote_files[args["file_path"]], False), False
         text, is_error = self._builtin_tools[name].run(args)
         return _server_render(name, text, is_error), is_error
 
@@ -231,11 +253,13 @@ class FakeCMAClient:
             else:
                 self._pending.append(_idle("retries_exhausted"))
             return
+        self._pending.append(SimpleNamespace(type="span.model_request_start"))  # one model message begins
         if step.get("text"):
             self._pending.append(
                 SimpleNamespace(type="agent.message", content=[SimpleNamespace(type="text", text=step["text"])])
             )
         calls = step_calls(step)
+        results: list[Any] = []  # server-produced results, delivered once the message is complete
         if calls:
             for c in calls:
                 ev_id = f"sevt_{uuid.uuid4().hex[:6]}"
@@ -245,15 +269,15 @@ class FakeCMAClient:
                         self._pending.append(SimpleNamespace(
                             type="agent.tool_use", id=ev_id, name=c["tool"], input=c["args"],
                             evaluated_permission="deny", evaluation=None))
-                        self._pending.append(_tool_result(ev_id, f"Permission to use {c['tool']} has been denied.", True))
+                        results.append(_tool_result(ev_id, f"Permission to use {c['tool']} has been denied.", True))
                         continue
                     if self.builtin_permission == "allow":
-                        # auto / always_allow: the server runs it immediately, no pause.
+                        # auto / always_allow: the server runs it itself, no pause.
                         self._pending.append(SimpleNamespace(
                             type="agent.tool_use", id=ev_id, name=c["tool"], input=c["args"],
                             evaluated_permission="allow", evaluation=SimpleNamespace(type="always_allow")))
                         text, is_error = self._execute_builtin(c["tool"], dict(c["args"]))
-                        self._pending.append(_tool_result(ev_id, text, is_error))
+                        results.append(_tool_result(ev_id, text, is_error))
                         continue
                     self._unresolved.add(ev_id)
                     self._builtin_calls[ev_id] = (c["tool"], dict(c["args"]))
@@ -267,12 +291,16 @@ class FakeCMAClient:
                     self._pending.append(
                         SimpleNamespace(type="agent.custom_tool_use", id=ev_id, name=c["tool"], input=c["args"])
                     )
+            self._pending.append(SimpleNamespace(type="span.model_request_end"))
+            self._pending.extend(results)
             if self._unresolved:
                 self._pending.append(_idle("requires_action", sorted(self._unresolved)))
             else:
-                self._advance()  # every call was refused by the server: the model goes on
-        elif step.get("end_turn", True):
-            self._pending.append(_idle("end_turn"))
+                self._advance()  # every call was run or refused by the server: the model goes on
+        else:
+            self._pending.append(SimpleNamespace(type="span.model_request_end"))
+            if step.get("end_turn", True):
+                self._pending.append(_idle("end_turn"))
 
     def _stream(self, *, session_id):
         client = self
